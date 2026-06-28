@@ -1,0 +1,39 @@
+services:
+  stream-sanitizer:
+    build: .
+    container_name: stream-sanitizer
+    ports:
+      - "8089:8000"
+    environment:
+      # --- CHOOSE YOUR VIDEO CODEC ---
+      # NVIDIA:
+      - VIDEO_CODEC=h264_nvenc
+      
+      # INTEL (QuickSync - Preferred for TrueNAS/Linux):
+      # - VIDEO_CODEC=h264_qsv
+      
+      # AMD / INTEL Standard (VAAPI generic driver):
+      # - VIDEO_CODEC=h264_vaapi
+      
+      # CPU Fallback:
+      # - VIDEO_CODEC=libx264
+      
+      - VIDEO_BITRATE=3000k
+      - AUDIO_BITRATE=128k
+    
+    # --- GPU PASS-THROUGH CONFIGURATIONS ---
+
+    # Option A: NVIDIA (Uncomment if using NVIDIA)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
+
+    # Option B: INTEL or AMD (Uncomment the lines below if using Intel/AMD)
+    # devices:
+    #   - /dev/dri:/dev/dri # Maps the host graphics cards directly into the container
+
+    restart: unless-stopped
