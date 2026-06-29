@@ -37,13 +37,16 @@ async def ffmpeg_stream_generator(stream_url: str):
 
     if VIDEO_CODEC == "h264_vaapi":
         ffmpeg_cmd.extend(["-vaapi_device", "/dev/dri/renderD128"])
+        vf_filter = "scale=1280:720,fps=30,format=nv12,hwupload"
+    else:
+        vf_filter = "scale=1280:720,fps=30"
 
     ffmpeg_cmd.extend([
         "-i", stream_url,
         "-map", "0:v:0",
         "-map", "0:a:0",
         "-c:v", VIDEO_CODEC,
-        "-vf", "scale=1280:720,fps=30",
+        "-vf", vf_filter,
         "-vsync", "cfr",
         "-b:v", VIDEO_BITRATE,
         "-maxrate:v", VIDEO_BITRATE,
@@ -62,8 +65,19 @@ async def ffmpeg_stream_generator(stream_url: str):
             *ffmpeg_cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL
+            stderr=asyncio.subprocess.PIPE
         )
+
+        async def _drain_stderr(proc):
+            try:
+                async for line in proc.stderr:
+                    decoded = line.decode(errors="ignore").strip()
+                    if decoded:
+                        logger.debug(f"[ffmpeg] {decoded}")
+            except Exception:
+                pass
+
+        stderr_task = asyncio.create_task(_drain_stderr(process))
 
         try:
             while True:
@@ -88,6 +102,7 @@ async def ffmpeg_stream_generator(stream_url: str):
                     await process.wait()
                 except ProcessLookupError:
                     pass
+            stderr_task.cancel()
         
         logger.warning("Upstream stream disconnected. Re-spawning worker...")
         await asyncio.sleep(1)
@@ -157,8 +172,9 @@ async def stream_proxy(request: Request):
         raise HTTPException(status_code=400, detail="Missing target URL token prefix.")
     
     target_url = raw_query[4:]
-    target_url = urllib.parse.unquote(target_url)
-    target_url = urllib.parse.unquote(target_url)
+    # Use unquote_plus to match the quote_plus() encoding used when the
+    # playlist URL was generated (quote_plus turns spaces into '+').
+    target_url = urllib.parse.unquote_plus(target_url)
     
     if not target_url:
         raise HTTPException(status_code=400, detail="Target stream URL payload is empty.")

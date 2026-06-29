@@ -24,10 +24,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-RUN pip3 install --no-cache-dir fastapi uvicorn requests
+RUN pip3 install --no-cache-dir fastapi "uvicorn[standard]" httpx
 
 COPY app.py .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Respect the PORT env var at runtime (falls back to 8000) instead of a hardcoded port
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
