@@ -23,15 +23,14 @@ PROBE_TIMEOUT = float(os.getenv("PROBE_TIMEOUT", "10"))
 
 
 async def probe_stream(stream_url: str) -> dict:
-    """Probe the source with ffprobe to find out what's actually in it
-    (video present?, audio present?) so the ffmpeg command can be built
-    to match instead of assuming a fixed video+stereo-audio layout."""
+    """Probe the source with ffprobe to find out what's actually in it."""
     info = {"has_video": True, "has_audio": True}
 
     ffprobe_cmd = [
         "ffprobe",
         "-nostdin",
         "-loglevel", "error",
+        "-no_subtitles", "1",          # Prevent ffprobe from looping on subtitles
         "-user_agent", STREAM_USER_AGENT,
         "-print_format", "json",
         "-show_streams",
@@ -79,22 +78,17 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         bitrate_int = 3000
 
     bufsize_str = f"{bitrate_int * 2}k"
-
-    # Fixed output frame rate, used for both the fps filter and the GOP size,
-    # so every output - regardless of the source's native fps/keyframe
-    # interval - gets a consistent, predictable closed-GOP structure. This
-    # matters a lot for Dispatcharr's TS segmenting and for client-side
-    # channel-change/seek stability.
     OUTPUT_FPS = 30
-    GOP_SIZE = OUTPUT_FPS * 2  # one keyframe every 2 seconds
+    GOP_SIZE = OUTPUT_FPS * 2  
 
     ffmpeg_cmd = [
         "ffmpeg",
         "-nostdin",
         "-loglevel", "warning",
-        "-allowed_extensions", "ALL",  # Stop nested manifest blocks from failing out
-        "-sn",                         # Drop subtitle processing completely to prevent EOF loops
-        "-dn",                         # Drop data track streams completely
+        "-allowed_extensions", "ALL",  
+        "-no_subtitles", "1",          # FORCE the HLS demuxer to completely ignore subtitle manifests
+        "-sn",                         # Strip them out from output mapping block
+        "-dn",                         # Drop data stream tracking tracks
         "-analyzeduration", "10000000",
         "-probesize", "10000000",
         "-user_agent", STREAM_USER_AGENT,
@@ -111,34 +105,26 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
 
     if VIDEO_CODEC == "h264_vaapi":
         ffmpeg_cmd.extend(["-vaapi_device", "/dev/dri/renderD128"])
-        # format=nv12,hwupload is required ahead of a vaapi encoder no matter
-        # what pixel format/colorspace the source actually was.
         vf_filter = f"scale=1280:720,fps={OUTPUT_FPS},format=nv12,hwupload"
     else:
-        # format=yuv420p forces every source down to the one pixel format
-        # virtually every TS decoder downstream can rely on.
         vf_filter = f"scale=1280:720,fps={OUTPUT_FPS},format=yuv420p"
 
     if has_video:
         ffmpeg_cmd.extend(["-i", stream_url])
     else:
-        # No video track in the source at all (e.g. an audio-only FAST slate feed).
-        # Synthesize a static color "card" so Dispatcharr doesn't drop the channel.
         ffmpeg_cmd.extend(["-f", "lavfi", "-i", f"color=c=black:s=1280x720:r={OUTPUT_FPS}"])
         ffmpeg_cmd.extend(["-i", stream_url])
 
     if not has_audio:
-        # No audio track in the source at all - synthesize a silent one.
         ffmpeg_cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
 
-    # Build -map args from which inputs actually exist.
     if has_video:
         video_input_idx = 0
         real_source_idx = 0
         next_free_idx = 1
     else:
-        video_input_idx = 0       # synthetic color source
-        real_source_idx = 1       # real (audio-only) source
+        video_input_idx = 0       
+        real_source_idx = 1       
         next_free_idx = 2
 
     if has_audio:
@@ -284,14 +270,12 @@ async def stream_proxy(request: Request):
     if not raw_query.startswith("url="):
         raise HTTPException(status_code=400, detail="Missing target URL token prefix.")
     
-    # Extract downstream url cleanly without stripping out internal character mappings
     target_url = raw_query[4:]
     target_url = urllib.parse.unquote(target_url)
 
     if not target_url:
         raise HTTPException(status_code=400, detail="Target stream URL payload is empty.")
 
-    # Fix nested parameter collisions causing double question marks in path definitions
     if target_url.count('?') > 1:
         path_part, sep, qs_part = target_url.partition('?')
         qs_part = qs_part.replace('?', '&')
@@ -321,7 +305,6 @@ async def playlist_proxy(url: str):
     for line in raw_m3u.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            # Use strict RFC quote to avoid flattening Masqueradarr's underlying parameters
             encoded_url = urllib.parse.quote(line, safe='')
             sanitized_line = f"{proxy_host}/stream?url={encoded_url}"
             sanitized_lines.append(sanitized_line)
