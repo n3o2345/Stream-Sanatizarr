@@ -80,6 +80,14 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
 
     bufsize_str = f"{bitrate_int * 2}k"
 
+    # Fixed output frame rate, used for both the fps filter and the GOP size,
+    # so every output - regardless of the source's native fps/keyframe
+    # interval - gets a consistent, predictable closed-GOP structure. This
+    # matters a lot for Dispatcharr's TS segmenting and for client-side
+    # channel-change/seek stability.
+    OUTPUT_FPS = 30
+    GOP_SIZE = OUTPUT_FPS * 2  # one keyframe every 2 seconds
+
     ffmpeg_cmd = [
         "ffmpeg",
         "-nostdin",
@@ -91,32 +99,68 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         "-reconnect_at_eof", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "5",
-        "-fflags", "+genpts+discardcorrupt",
+        "-fflags", "+genpts+discardcorrupt+igndts",
         "-avoid_negative_ts", "make_zero",
     ]
 
+    has_video = probe.get("has_video", True)
+    has_audio = probe.get("has_audio", True)
+
     if VIDEO_CODEC == "h264_vaapi":
         ffmpeg_cmd.extend(["-vaapi_device", "/dev/dri/renderD128"])
-        vf_filter = "scale=1280:720,fps=30,format=nv12,hwupload"
+        # format=nv12,hwupload is required ahead of a vaapi encoder no matter
+        # what pixel format/colorspace the source actually was (yuv420p,
+        # yuv422p, 10-bit, full-range "yuvj" variants, etc).
+        vf_filter = f"scale=1280:720,fps={OUTPUT_FPS},format=nv12,hwupload"
     else:
-        vf_filter = "scale=1280:720,fps=30"
+        # format=yuv420p forces every source down to the one pixel format
+        # virtually every TS decoder downstream can rely on, regardless of
+        # the source's native chroma subsampling/bit depth.
+        vf_filter = f"scale=1280:720,fps={OUTPUT_FPS},format=yuv420p"
 
-    ffmpeg_cmd.extend(["-i", stream_url])
-
-    has_audio = probe.get("has_audio", True)
+    if has_video:
+        ffmpeg_cmd.extend(["-i", stream_url])
+    else:
+        # No video track in the source at all (e.g. an audio-only FAST
+        # slate/ad-break feed). Synthesize a static color "card" so
+        # Dispatcharr/clients that expect a video PID don't drop the channel.
+        ffmpeg_cmd.extend(["-f", "lavfi", "-i", f"color=c=black:s=1280x720:r={OUTPUT_FPS}"])
+        ffmpeg_cmd.extend(["-i", stream_url])
 
     if not has_audio:
         # No audio track in the source at all - synthesize a silent one so
         # downstream players/Dispatcharr that expect an audio PID don't choke.
         ffmpeg_cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
 
-    ffmpeg_cmd.extend(["-map", "0:v:0"])
-    ffmpeg_cmd.extend(["-map", "1:a:0" if not has_audio else "0:a:0?"])
+    # Build -map args from which inputs actually exist, rather than assuming
+    # a fixed "input 0 has both video and audio" layout - input indices
+    # shift depending on whether the synthetic color/silence generators
+    # were inserted above.
+    if has_video:
+        video_input_idx = 0
+        real_source_idx = 0
+        next_free_idx = 1
+    else:
+        video_input_idx = 0       # synthetic color source
+        real_source_idx = 1       # real (audio-only) source
+        next_free_idx = 2
+
+    if has_audio:
+        audio_map = f"{real_source_idx}:a:0?"
+    else:
+        audio_map = f"{next_free_idx}:a:0"
+
+    ffmpeg_cmd.extend(["-map", f"{video_input_idx}:v:0"])
+    ffmpeg_cmd.extend(["-map", audio_map])
 
     ffmpeg_cmd.extend([
         "-c:v", VIDEO_CODEC,
         "-vf", vf_filter,
         "-vsync", "cfr",
+        "-r", str(OUTPUT_FPS),
+        "-g", str(GOP_SIZE),
+        "-keyint_min", str(GOP_SIZE),
+        "-sc_threshold", "0",
         "-b:v", VIDEO_BITRATE,
         "-maxrate:v", VIDEO_BITRATE,
         "-bufsize:v", bufsize_str,
@@ -124,6 +168,10 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         "-ac", "2",
         "-ar", "48000",
         "-b:a", AUDIO_BITRATE,
+        "-af", "aresample=async=1:first_pts=0",
+        "-mpegts_flags", "+resend_headers",
+        "-muxdelay", "0",
+        "-muxpreload", "0",
         "-f", "mpegts",
         "pipe:1",
     ])
