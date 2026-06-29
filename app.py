@@ -297,18 +297,13 @@ async def stream_proxy(request: Request):
     
     target_url = raw_query[4:]
     # Use unquote_plus to match the quote_plus() encoding used when the
-    # playlist URL was generated (quote_plus turns spaces into '+').
+    # playlist URL was generated.
     target_url = urllib.parse.unquote_plus(target_url)
 
     if not target_url:
         raise HTTPException(status_code=400, detail="Target stream URL payload is empty.")
 
-    # Some upstream URLs (e.g. Dispatcharr LocalNow) embed a percent-encoded
-    # query string inside the path segment - e.g. localnow%3A%2F%2FGUID%3Fslug%3Dalf
-    # After unquote_plus the %3F becomes a literal '?' producing a double-'?' URL
-    # (path?slug=alf?token=...) that FFmpeg rejects as invalid.
-    # Fix: partition on the FIRST '?' only (the real query string), then
-    # replace any subsequent stray '?' characters inside the query string with '&'.
+    # Fix formatting rules for double question marks in downstream query strings.
     if target_url.count('?') > 1:
         path_part, sep, qs_part = target_url.partition('?')
         qs_part = qs_part.replace('?', '&')
@@ -337,17 +332,10 @@ async def playlist_proxy(url: str):
     for line in raw_m3u.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            # Some upstream playlist sources hand back stream URLs that are
-            # already partially percent-encoded (e.g. a redirect param
-            # embedded as "%3Fslug%3Dalf" inside an otherwise-raw URL).
-            # Use plain unquote() (NOT unquote_plus) here - unquote_plus
-            # would also treat any literal '+' character in a token as an
-            # encoded space and corrupt it. Decoding %XX sequences only
-            # collapses any pre-existing encoding down to raw characters,
-            # so quote_plus() below applies exactly one consistent layer
-            # of encoding instead of double-escaping what the source sent.
-            normalized_line = urllib.parse.unquote(line)
-            encoded_url = urllib.parse.quote_plus(normalized_line)
+            # Do NOT use unquote() here anymore. We must preserve internal upstream path 
+            # encoding (like Dispatcharr's embedded sub-tokens) intact so they 
+            # decode properly when requested through our /stream route.
+            encoded_url = urllib.parse.quote_plus(line)
             sanitized_line = f"{proxy_host}/stream?url={encoded_url}"
             sanitized_lines.append(sanitized_line)
         else:
