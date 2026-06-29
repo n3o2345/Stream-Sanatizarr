@@ -3,25 +3,19 @@ import logging
 import os
 import urllib.parse
 import requests
-from fastapi import FastAPI, HTTPException, Response, Query
+from fastapi import FastAPI, HTTPException, Response, Query, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
 
-# Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("StreamSanitizarr")
 
 app = FastAPI(title="FAST Stream Sanitizer Proxy")
 
-# Environment configuration defaults
 VIDEO_CODEC = os.getenv("VIDEO_CODEC", "libx264")  
 VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "3000k")
 AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 
 async def ffmpeg_stream_generator(stream_url: str):
-    """
-    Spawns FFmpeg workers to normalize the stream. 
-    Loops infinitely to resume if the upstream connection drops during ad breaks.
-    """
     ffmpeg_cmd = [
         "ffmpeg",
         "-reconnect", "1",
@@ -100,7 +94,6 @@ async def web_ui(source: str = Query(None)):
 
     generated_url = ""
     if source:
-        # Full query string parameter preservation
         encoded_source = urllib.parse.quote_plus(source.strip())
         generated_url = f"{proxy_host}/playlist?url={encoded_source}"
 
@@ -170,11 +163,23 @@ async def web_ui(source: str = Query(None)):
     return HTMLResponse(content=html_content)
 
 @app.get("/stream")
-async def stream_proxy(url: str):
-    if not url:
-        raise HTTPException(status_code=400, detail="Missing required 'url' parameter.")
-    # Use standard raw query string extraction to capture multi-parameter tokens seamlessly
-    return StreamingResponse(ffmpeg_stream_generator(url), media_type="video/mp2t")
+async def stream_proxy(request: Request):
+    """
+    Bypasses standard query parsing to capture the exact raw, untouched 
+    nested URL parameters required by the upstream server.
+    """
+    raw_query = request.url.query
+    if not raw_query.startswith("url="):
+        raise HTTPException(status_code=400, detail="Missing required 'url' query prefix.")
+    
+    # Extract everything after 'url=' exactly as it hit the server network block
+    target_url = raw_query[4:]
+    target_url = urllib.parse.unquote_plus(target_url)
+    
+    if not target_url:
+        raise HTTPException(status_code=400, detail="Empty stream destination URL.")
+        
+    return StreamingResponse(ffmpeg_stream_generator(target_url), media_type="video/mp2t")
 
 @app.get("/playlist")
 async def playlist_proxy(url: str):
@@ -193,7 +198,6 @@ async def playlist_proxy(url: str):
     for line in raw_m3u.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            # FIX: Safely encodes nested parameters (& token=... & pl=...) 
             encoded_url = urllib.parse.quote_plus(line)
             sanitized_line = f"{proxy_host}/stream?url={encoded_url}"
             sanitized_lines.append(sanitized_line)
