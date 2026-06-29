@@ -16,7 +16,6 @@ VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "3000k")
 AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 
 async def ffmpeg_stream_generator(stream_url: str):
-    # Safe numerical evaluation of the buffer size string
     try:
         clean_bitrate = "".join(c for c in VIDEO_BITRATE if c.isdigit())
         bitrate_int = int(clean_bitrate) if clean_bitrate else 3000
@@ -27,7 +26,7 @@ async def ffmpeg_stream_generator(stream_url: str):
 
     ffmpeg_cmd = [
         "ffmpeg",
-        "-nostdin",                     # Prevents interactive prompts from dropping execution
+        "-nostdin",
         "-reconnect", "1",
         "-reconnect_at_eof", "1",
         "-reconnect_streamed", "1",
@@ -41,14 +40,14 @@ async def ffmpeg_stream_generator(stream_url: str):
 
     ffmpeg_cmd.extend([
         "-i", stream_url,
-        "-map", "0:v:0",                # Explicitly pass only the primary video track
-        "-map", "0:a:0",                # Explicitly pass only the primary audio track
+        "-map", "0:v:0",
+        "-map", "0:a:0",
         "-c:v", VIDEO_CODEC,
         "-vf", "scale=1280:720,fps=30",
         "-vsync", "cfr",
         "-b:v", VIDEO_BITRATE,
         "-maxrate:v", VIDEO_BITRATE,
-        "-bufsize:v", bufsize_str,      # Cleaned and processed buffer string
+        "-bufsize:v", bufsize_str,
         "-c:a", "aac",
         "-ac", "2",
         "-ar", "48000",
@@ -61,7 +60,7 @@ async def ffmpeg_stream_generator(stream_url: str):
         logger.info(f"Spawning FFmpeg worker for stream: {stream_url}")
         process = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
-            stdin=asyncio.subprocess.DEVNULL, # Set standard input boundary explicitly
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL
         )
@@ -97,31 +96,10 @@ async def ffmpeg_stream_generator(stream_url: str):
 async def web_ui(source: str = Query(None)):
     proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://localhost:8000").rstrip("/")
     
-    predefined_env = os.getenv("PREDEFINED_PLAYLISTS", "")
-    playlists = []
-    if predefined_env:
-        for item in predefined_env.split(","):
-            if "|" in item:
-                name, url = item.split("|", 1)
-                playlists.append({"name": name.strip(), "url": url.strip()})
-
     generated_url = ""
     if source:
         encoded_source = urllib.parse.quote_plus(source.strip())
         generated_url = f"{proxy_host}/playlist?url={encoded_source}"
-
-    playlists_html = ""
-    if playlists:
-        playlists_html = "<h3>Preconfigured Playlists</h3>"
-        for pl in playlists:
-            enc_url = urllib.parse.quote_plus(pl['url'])
-            sanitized_url = f"{proxy_host}/playlist?url={enc_url}"
-            playlists_html += f"""
-            <div class="playlist-item">
-                <strong>{pl['name']}</strong>
-                <div class="result-url" onclick="navigator.clipboard.writeText('{sanitized_url}'); alert('Copied {pl['name']} link!');">{sanitized_url}</div>
-            </div>
-            """
 
     html_content = f"""
     <!DOCTYPE html>
@@ -134,7 +112,6 @@ async def web_ui(source: str = Query(None)):
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121214; color: #e1e1e6; padding: 40px 20px; max-width: 650px; margin: 0 auto; }}
             .container {{ background: #1d1d22; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); border: 1px solid #29292e; }}
             h1 {{ margin-top: 0; color: #4fffaf; font-size: 24px; }}
-            h3 {{ margin-top: 25px; border-bottom: 1px solid #29292e; padding-bottom: 8px; color: #fff; }}
             p {{ color: #a8a8b3; font-size: 14px; line-height: 1.5; }}
             label {{ display: block; margin-bottom: 8px; font-weight: 600; font-size: 14px; }}
             input[type="url"] {{ width: 100%; padding: 12px; border: 1px solid #29292e; background: #121214; color: #fff; border-radius: 4px; box-sizing: border-box; font-size: 14px; margin-bottom: 15px; }}
@@ -142,8 +119,6 @@ async def web_ui(source: str = Query(None)):
             button {{ background: #4fffaf; color: #000; border: none; padding: 12px 20px; font-weight: bold; border-radius: 4px; cursor: pointer; font-size: 14px; width: 100%; transition: background 0.2s; }}
             button:hover {{ background: #3ae099; }}
             .result-box {{ margin-top: 25px; padding: 15px; background: #121214; border-radius: 4px; border-left: 4px solid #4fffaf; }}
-            .playlist-item {{ background: #121214; padding: 12px; border-radius: 6px; margin-bottom: 12px; border: 1px solid #29292e; }}
-            .playlist-item strong {{ display: block; margin-bottom: 6px; font-size: 14px; color: #fff; }}
             .result-title {{ font-weight: bold; font-size: 12px; color: #a8a8b3; text-transform: uppercase; margin-bottom: 8px; }}
             .result-url {{ font-family: monospace; word-break: break-all; background: #29292e; padding: 10px; border-radius: 4px; font-size: 13px; color: #4fffaf; user-select: all; cursor: pointer; }}
             .copy-hint {{ font-size: 11px; color: #737380; margin-top: 5px; }}
@@ -167,8 +142,6 @@ async def web_ui(source: str = Query(None)):
                 <div class="copy-hint">💡 Click the link above to copy it.</div>
             </div>
             ''' if generated_url else ''}
-
-            {playlists_html}
         </div>
     </body>
     </html>
@@ -223,4 +196,6 @@ async def playlist_proxy(url: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Dynamically read the custom port from environmental variable definition
+    run_port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=run_port)
