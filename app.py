@@ -16,6 +16,15 @@ VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "3000k")
 AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 
 async def ffmpeg_stream_generator(stream_url: str):
+    # Safe numerical evaluation of the buffer size string
+    try:
+        clean_bitrate = "".join(c for c in VIDEO_BITRATE if c.isdigit())
+        bitrate_int = int(clean_bitrate) if clean_bitrate else 3000
+    except Exception:
+        bitrate_int = 3000
+        
+    bufsize_str = f"{bitrate_int * 2}k"
+
     ffmpeg_cmd = [
         "ffmpeg",
         "-nostdin",                     # Prevents interactive prompts from dropping execution
@@ -39,7 +48,7 @@ async def ffmpeg_stream_generator(stream_url: str):
         "-vsync", "cfr",
         "-b:v", VIDEO_BITRATE,
         "-maxrate:v", VIDEO_BITRATE,
-        "-bufsize:v", f"{int(VIDEO_BITRATE.replace('k',''))*2}k",
+        "-bufsize:v", bufsize_str,      # Cleaned and processed buffer string
         "-c:a", "aac",
         "-ac", "2",
         "-ar", "48000",
@@ -52,6 +61,7 @@ async def ffmpeg_stream_generator(stream_url: str):
         logger.info(f"Spawning FFmpeg worker for stream: {stream_url}")
         process = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
+            stdin=asyncio.subprocess.DEVNULL, # Set standard input boundary explicitly
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL
         )
@@ -209,4 +219,8 @@ async def playlist_proxy(url: str):
         else:
             sanitized_lines.append(line)
             
-    return Response(content="\n".join(sanitized_lines), media_type
+    return Response(content="\n".join(sanitized_lines), media_type="application/x-mpegurl")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
