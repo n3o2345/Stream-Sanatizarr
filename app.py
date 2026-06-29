@@ -308,11 +308,11 @@ async def stream_proxy(request: Request):
     # After unquote_plus the %3F becomes a literal '?' producing a double-'?' URL
     # (path?slug=alf?token=...) that FFmpeg rejects as invalid.
     # Fix: partition on the FIRST '?' only (the real query string), then
-    # re-encode any remaining bare '?' characters in the path segment.
+    # replace any subsequent stray '?' characters inside the query string with '&'.
     if target_url.count('?') > 1:
-        path_part, _, qs_part = target_url.partition('?')
-        path_part = path_part.replace('?', '%3F')
-        target_url = f"{path_part}?{qs_part}"
+        path_part, sep, qs_part = target_url.partition('?')
+        qs_part = qs_part.replace('?', '&')
+        target_url = f"{path_part}{sep}{qs_part}"
 
     logger.info(f"Targeting sanitized stream destination: {target_url}")
     return StreamingResponse(ffmpeg_stream_generator(target_url), media_type="video/mp2t")
