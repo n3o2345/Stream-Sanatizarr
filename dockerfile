@@ -1,18 +1,20 @@
-# We use the NVIDIA runtime base as the default since it's the hardest to set up manually
+# =========================================================================
+# 1. BASE IMAGE SELECTION 
+# =========================================================================
+# Option A: For NVIDIA GPU setups (Leave uncommented if using NVIDIA)
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
-# Standard Ubuntu Base Alternative (RECOMMENDED for Intel / AMD)
-# If using Intel or AMD, uncomment the line below and comment out the NVIDIA FROM line above
+# Option B: For Intel or AMD setups (Uncomment below and comment out NVIDIA above)
 # FROM ubuntu:22.04
+# =========================================================================
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies, Python, FFmpeg, and Intel/AMD VAAPI runtimes
+# Install dependencies, Python, FFmpeg, and multi-platform hardware drivers
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     ffmpeg \
-    # --- INTEL & AMD DRIVER PACKAGES ---
     va-driver-all \
     vdpau-driver-all \
     intel-media-va-driver-non-free \
@@ -22,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-RUN pip3 install --no-cache-dir fastapi uvicorn
+RUN pip3 install --no-cache-dir fastapi uvicorn requests
 
 COPY app.py .
 

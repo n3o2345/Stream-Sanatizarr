@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import os
-import sys
-from fastapi import FastAPI, HTTPException
+import urllib.parse
+import requests
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
 
 # Setup logging
@@ -12,7 +13,7 @@ logger = logging.getLogger("StreamSanitizer")
 app = FastAPI(title="FAST Stream Sanitizer Proxy")
 
 # Environment configuration defaults
-VIDEO_CODEC = os.getenv("VIDEO_CODEC", "libx264")  # Use 'h264_nvenc' for NVIDIA hardware acceleration
+VIDEO_CODEC = os.getenv("VIDEO_CODEC", "libx264")  
 VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "3000k")
 AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 
@@ -21,7 +22,6 @@ async def ffmpeg_stream_generator(stream_url: str):
     Spawns FFmpeg workers to normalize the stream. 
     Loops infinitely to resume if the upstream connection drops during ad breaks.
     """
-    # FFmpeg arguments to flatten discontinuities and normalize parameters
     ffmpeg_cmd = [
         "ffmpeg",
         "-reconnect", "1",
@@ -30,6 +30,13 @@ async def ffmpeg_stream_generator(stream_url: str):
         "-reconnect_delay_max", "5",
         "-fflags", "+genpts+async",
         "-avoid_negative_ts", "make_zero",
+    ]
+
+    # Required initialization parameter ONLY if using generic VAAPI (AMD/Intel)
+    if VIDEO_CODEC == "h264_vaapi":
+        ffmpeg_cmd.extend(["-vaapi_device", "/dev/dri/renderD128"])
+
+    ffmpeg_cmd.extend([
         "-i", stream_url,
         
         # Video Normalization
@@ -49,7 +56,7 @@ async def ffmpeg_stream_generator(stream_url: str):
         # Output Format
         "-f", "mpegts",
         "pipe:1"
-    ]
+    ])
 
     while True:
         logger.info(f"Spawning FFmpeg worker for stream: {stream_url}")
@@ -60,11 +67,9 @@ async def ffmpeg_stream_generator(stream_url: str):
         )
 
         try:
-            # Continuously read chunks from stdout and yield to client
             while True:
                 chunk = await process.stdout.read(65536) # 64KB chunks
                 if not chunk:
-                    # No data means FFmpeg exited (likely stream dropped or profile shifted)
                     break
                 yield chunk
         except asyncio.CancelledError:
@@ -78,7 +83,6 @@ async def ffmpeg_stream_generator(stream_url: str):
         except Exception as e:
             logger.error(f"Error while reading stream chunks: {e}")
         finally:
-            # Ensure the process is dead before looping or exiting
             if process.returncode is None:
                 try:
                     process.terminate()
@@ -99,6 +103,39 @@ async def stream_proxy(url: str):
         ffmpeg_stream_generator(url),
         media_type="video/mp2t"
     )
+
+@app.get("/playlist")
+async def playlist_proxy(url: str):
+    """
+    Fetches a remote source M3U playlist and rewrites all channel stream URLs 
+    to route through this stabilizer proxy before heading to Dispatcharr.
+    """
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing required 'url' parameter.")
+    
+    try:
+        logger.info(f"Fetching raw source playlist from: {url}")
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        raw_m3u = response.text
+    except Exception as e:
+        logger.error(f"Failed to fetch source playlist: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to fetch source playlist: {e}")
+
+    # Set your host URL environment parameter dynamically
+    proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://localhost:8089")
+    sanitized_lines = []
+    
+    for line in raw_m3u.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            encoded_url = urllib.parse.quote_plus(line)
+            sanitized_line = f"{proxy_host}/stream?url={encoded_url}"
+            sanitized_lines.append(sanitized_line)
+        else:
+            sanitized_lines.append(line)
+            
+    return Response(content="\n".join(sanitized_lines), media_type="application/x-mpegurl")
 
 if __name__ == "__main__":
     import uvicorn

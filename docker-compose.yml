@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   stream-sanitizer:
     build: .
@@ -5,25 +7,22 @@ services:
     ports:
       - "8089:8000"
     environment:
-      # --- CHOOSE YOUR VIDEO CODEC ---
-      # NVIDIA:
-      - VIDEO_CODEC=h264_nvenc
-      
-      # INTEL (QuickSync - Preferred for TrueNAS/Linux):
-      # - VIDEO_CODEC=h264_qsv
-      
-      # AMD / INTEL Standard (VAAPI generic driver):
-      # - VIDEO_CODEC=h264_vaapi
-      
-      # CPU Fallback:
-      # - VIDEO_CODEC=libx264
+      # --- 1. CHOOSE YOUR HARDWARE ACCELERATION CODEC ---
+      - VIDEO_CODEC=h264_nvenc        # NVIDIA (Default)
+      # - VIDEO_CODEC=h264_qsv        # Intel QuickSync (Uncomment to use)
+      # - VIDEO_CODEC=h264_vaapi      # AMD / Generic VAAPI (Uncomment to use)
+      # - VIDEO_CODEC=libx264         # CPU Software Fallback (Uncomment to use)
       
       - VIDEO_BITRATE=3000k
       - AUDIO_BITRATE=128k
+      
+      # --- 2. THE STABILIZER'S NETWORK ADDRESS ---
+      # Replace with your actual server IP so the playlist generator builds the correct links
+      - PROXY_PUBLIC_URL=http://192.168.1.50:8089 
     
-    # --- GPU PASS-THROUGH CONFIGURATIONS ---
+    # --- 3. HARDWARE MAPPING (Choose your hardware block) ---
 
-    # Option A: NVIDIA (Uncomment if using NVIDIA)
+    # Option A: NVIDIA Pass-through (Leave uncommented if using NVIDIA)
     deploy:
       resources:
         reservations:
@@ -32,8 +31,8 @@ services:
               count: all
               capabilities: [gpu, video]
 
-    # Option B: INTEL or AMD (Uncomment the lines below if using Intel/AMD)
+    # Option B: Intel or AMD Direct Rendering Nodes (Uncomment below if using Intel/AMD)
     # devices:
-    #   - /dev/dri:/dev/dri # Maps the host graphics cards directly into the container
+    #   - /dev/dri:/dev/dri
 
     restart: unless-stopped
