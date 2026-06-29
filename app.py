@@ -202,17 +202,14 @@ async def playlist_proxy(url: str):
     for line in raw_m3u.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            # Some upstream playlist sources hand back stream URLs that are
-            # already partially percent-encoded (e.g. a redirect param
-            # embedded as "%3Fslug%3Dalf" inside an otherwise-raw URL).
-            # Use plain unquote() (NOT unquote_plus) here - unquote_plus
-            # would also treat any literal '+' character in a token as an
-            # encoded space and corrupt it. Decoding %XX sequences only
-            # collapses any pre-existing encoding down to raw characters,
-            # so quote_plus() below applies exactly one consistent layer
-            # of encoding instead of double-escaping what the source sent.
-            normalized_line = urllib.parse.unquote(line)
-            encoded_url = urllib.parse.quote_plus(normalized_line)
+            # Do NOT unquote first — URLs like Dispatcharr's LocalNow streams
+            # intentionally embed percent-encoded segments in the path
+            # (e.g. localnow%3A%2F%2F...%3Fslug%3Dalf) that must be preserved
+            # as-is. Unquoting before re-encoding corrupts the URL structure
+            # by collapsing structural encoding that the upstream server expects.
+            # quote_plus(safe='') on the raw line applies exactly one consistent
+            # encoding layer; unquote_plus in /stream then restores it faithfully.
+            encoded_url = urllib.parse.quote_plus(line, safe='')
             sanitized_line = f"{proxy_host}/stream?url={encoded_url}"
             sanitized_lines.append(sanitized_line)
         else:
