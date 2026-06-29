@@ -23,7 +23,9 @@ PROBE_TIMEOUT = float(os.getenv("PROBE_TIMEOUT", "10"))
 
 
 async def probe_stream(stream_url: str) -> dict:
-    """Probe the source with ffprobe to find out what's actually in it."""
+    """Probe the source with ffprobe to find out what's actually in it
+    (video present?, audio present?) so the ffmpeg command can be built
+    to match instead of assuming a fixed video+stereo-audio layout."""
     info = {"has_video": True, "has_audio": True}
 
     ffprobe_cmd = [
@@ -77,6 +79,12 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         bitrate_int = 3000
 
     bufsize_str = f"{bitrate_int * 2}k"
+
+    # Fixed output frame rate, used for both the fps filter and the GOP size,
+    # so every output - regardless of the source's native fps/keyframe
+    # interval - gets a consistent, predictable closed-GOP structure. This
+    # matters a lot for Dispatcharr's TS segmenting and for client-side
+    # channel-change/seek stability.
     OUTPUT_FPS = 30
     GOP_SIZE = OUTPUT_FPS * 2  # one keyframe every 2 seconds
 
@@ -84,6 +92,9 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         "ffmpeg",
         "-nostdin",
         "-loglevel", "warning",
+        "-allowed_extensions", "ALL",  # Stop nested manifest blocks from failing out
+        "-sn",                         # Drop subtitle processing completely to prevent EOF loops
+        "-dn",                         # Drop data track streams completely
         "-analyzeduration", "10000000",
         "-probesize", "10000000",
         "-user_agent", STREAM_USER_AGENT,
@@ -100,26 +111,34 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
 
     if VIDEO_CODEC == "h264_vaapi":
         ffmpeg_cmd.extend(["-vaapi_device", "/dev/dri/renderD128"])
+        # format=nv12,hwupload is required ahead of a vaapi encoder no matter
+        # what pixel format/colorspace the source actually was.
         vf_filter = f"scale=1280:720,fps={OUTPUT_FPS},format=nv12,hwupload"
     else:
+        # format=yuv420p forces every source down to the one pixel format
+        # virtually every TS decoder downstream can rely on.
         vf_filter = f"scale=1280:720,fps={OUTPUT_FPS},format=yuv420p"
 
     if has_video:
         ffmpeg_cmd.extend(["-i", stream_url])
     else:
+        # No video track in the source at all (e.g. an audio-only FAST slate feed).
+        # Synthesize a static color "card" so Dispatcharr doesn't drop the channel.
         ffmpeg_cmd.extend(["-f", "lavfi", "-i", f"color=c=black:s=1280x720:r={OUTPUT_FPS}"])
         ffmpeg_cmd.extend(["-i", stream_url])
 
     if not has_audio:
+        # No audio track in the source at all - synthesize a silent one.
         ffmpeg_cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
 
+    # Build -map args from which inputs actually exist.
     if has_video:
         video_input_idx = 0
         real_source_idx = 0
         next_free_idx = 1
     else:
-        video_input_idx = 0       
-        real_source_idx = 1       
+        video_input_idx = 0       # synthetic color source
+        real_source_idx = 1       # real (audio-only) source
         next_free_idx = 2
 
     if has_audio:
@@ -225,13 +244,15 @@ async def web_ui(source: str = Query(None)):
         <meta charset="UTF-8">
         <title>Stream-Sanatizarr Dashboard</title>
         <style>
-            body {{ font-family: sans-serif; background: #121214; color: #e1e1e6; padding: 40px; max-width: 650px; margin: 0 auto; }}
-            .container {{ background: #1d1d22; padding: 30px; border-radius: 8px; border: 1px solid #29292e; }}
-            h1 {{ color: #4fffaf; }}
-            input[type="url"] {{ width: 100%; padding: 12px; background: #121214; color: #fff; border: 1px solid #29292e; border-radius: 4px; box-sizing: border-box; margin-bottom: 15px; }}
-            button {{ background: #4fffaf; color: #000; border: none; padding: 12px; font-weight: bold; border-radius: 4px; cursor: pointer; width: 100%; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #121214; color: #e1e1e6; padding: 40px; max-width: 650px; margin: 0 auto; }}
+            .container {{ background: #1d1d22; padding: 30px; border-radius: 8px; border: 1px solid #29292e; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }}
+            h1 {{ color: #4fffaf; margin-top: 0; }}
+            input[type="url"] {{ width: 100%; padding: 12px; background: #121214; color: #fff; border: 1px solid #29292e; border-radius: 4px; box-sizing: border-box; margin-bottom: 15px; font-size: 14px; }}
+            input[type="url"]:focus {{ border-color: #4fffaf; outline: none; }}
+            button {{ background: #4fffaf; color: #000; border: none; padding: 12px; font-weight: bold; border-radius: 4px; cursor: pointer; width: 100%; font-size: 14px; }}
+            button:hover {{ background: #3ae099; }}
             .result-box {{ margin-top: 25px; padding: 15px; background: #121214; border-radius: 4px; border-left: 4px solid #4fffaf; }}
-            .result-url {{ font-family: monospace; background: #29292e; padding: 10px; border-radius: 4px; color: #4fffaf; word-break: break-all; }}
+            .result-url {{ font-family: monospace; background: #29292e; padding: 10px; border-radius: 4px; color: #4fffaf; word-break: break-all; font-size: 13px; user-select: all; cursor: pointer; }}
         </style>
     </head>
     <body>
@@ -245,7 +266,7 @@ async def web_ui(source: str = Query(None)):
             {f'''
             <div class="result-box">
                 <div class="result-title">Copy this URL into Dispatcharr:</div>
-                <div class="result-url">{generated_url}</div>
+                <div class="result-url" onclick="navigator.clipboard.writeText(this.innerText); alert('Copied!');">{generated_url}</div>
             </div>
             ''' if generated_url else ''}
         </div>
@@ -263,12 +284,18 @@ async def stream_proxy(request: Request):
     if not raw_query.startswith("url="):
         raise HTTPException(status_code=400, detail="Missing target URL token prefix.")
     
-    # Extract everything after 'url=' precisely without throwing away nested encoding sequences
+    # Extract downstream url cleanly without stripping out internal character mappings
     target_url = raw_query[4:]
     target_url = urllib.parse.unquote(target_url)
 
     if not target_url:
         raise HTTPException(status_code=400, detail="Target stream URL payload is empty.")
+
+    # Fix nested parameter collisions causing double question marks in path definitions
+    if target_url.count('?') > 1:
+        path_part, sep, qs_part = target_url.partition('?')
+        qs_part = qs_part.replace('?', '&')
+        target_url = f"{path_part}{sep}{qs_part}"
 
     logger.info(f"Targeting sanitized stream destination: {target_url}")
     return StreamingResponse(ffmpeg_stream_generator(target_url), media_type="video/mp2t")
@@ -294,7 +321,7 @@ async def playlist_proxy(url: str):
     for line in raw_m3u.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            # Use strict RFC-compliant quote without touching sub-parameters inside the token path
+            # Use strict RFC quote to avoid flattening Masqueradarr's underlying parameters
             encoded_url = urllib.parse.quote(line, safe='')
             sanitized_line = f"{proxy_host}/stream?url={encoded_url}"
             sanitized_lines.append(sanitized_line)
