@@ -165,20 +165,26 @@ async def web_ui(source: str = Query(None)):
 @app.get("/stream")
 async def stream_proxy(request: Request):
     """
-    Bypasses standard query parsing to capture the exact raw, untouched 
-    nested URL parameters required by the upstream server.
+    Extracts the full raw bytes scope directly from the ASGI server layer
+    to prevent broken parameter mapping on complex nested query string tags.
     """
-    raw_query = request.url.query
-    if not raw_query.startswith("url="):
-        raise HTTPException(status_code=400, detail="Missing required 'url' query prefix.")
+    raw_query_bytes = request.scope.get("query_string", b"")
+    raw_query = raw_query_bytes.decode("utf-8")
     
-    # Extract everything after 'url=' exactly as it hit the server network block
+    if not raw_query.startswith("url="):
+        raise HTTPException(status_code=400, detail="Missing target URL token prefix.")
+    
+    # Grab absolutely everything after 'url=' completely intact
     target_url = raw_query[4:]
-    target_url = urllib.parse.unquote_plus(target_url)
+    
+    # Unquote twice to cleanly clean double-wrapped symbols (%253F -> %3F -> ?)
+    target_url = urllib.parse.unquote(target_url)
+    target_url = urllib.parse.unquote(target_url)
     
     if not target_url:
-        raise HTTPException(status_code=400, detail="Empty stream destination URL.")
+        raise HTTPException(status_code=400, detail="Target stream URL payload is empty.")
         
+    logger.info(f"Targeting sanitized stream destination: {target_url}")
     return StreamingResponse(ffmpeg_stream_generator(target_url), media_type="video/mp2t")
 
 @app.get("/playlist")
