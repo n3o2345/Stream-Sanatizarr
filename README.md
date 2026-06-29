@@ -94,4 +94,6 @@ Pick **one** codec/hardware combination and update both files:
 
 ## License
 
-No license file is currently included — add one (MIT, GPL, etc.) before distributing publicly if you intend others to use/modify this freely.
+This project is licensed under the GNU General Public License v3.0 (GPLv3).
+
+In short: you're free to use, modify, and distribute this software, but any distributed copies or derivative works must also be licensed under GPLv3, must include the source code, and must preserve copyright/license notices. See the LICENSE file for the full terms, or read the canonical text at https://www.gnu.org/licenses/gpl-3.0.html.
