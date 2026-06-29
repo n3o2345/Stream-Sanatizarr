@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("StreamSanitizer")
+logger = logging.getLogger("StreamSanitizarr")
 
 app = FastAPI(title="FAST Stream Sanitizer Proxy")
 
@@ -83,20 +83,39 @@ async def ffmpeg_stream_generator(stream_url: str):
                 except ProcessLookupError:
                     pass
         
-        logger.warning("Upstream stream disconnected/shifted. Re-spawning worker in 1 second...")
+        logger.warning("Upstream stream disconnected. Re-spawning worker...")
         await asyncio.sleep(1)
 
 @app.get("/", response_class=HTMLResponse)
 async def web_ui(source: str = Query(None)):
-    """
-    Serves a simple web interface to generate sanitized M3U links.
-    """
     proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://localhost:8089").rstrip("/")
-    generated_url = ""
     
+    predefined_env = os.getenv("PREDEFINED_PLAYLISTS", "")
+    playlists = []
+    if predefined_env:
+        for item in predefined_env.split(","):
+            if "|" in item:
+                name, url = item.split("|", 1)
+                playlists.append({"name": name.strip(), "url": url.strip()})
+
+    generated_url = ""
     if source:
+        # Full query string parameter preservation
         encoded_source = urllib.parse.quote_plus(source.strip())
         generated_url = f"{proxy_host}/playlist?url={encoded_source}"
+
+    playlists_html = ""
+    if playlists:
+        playlists_html = "<h3>Preconfigured Playlists</h3>"
+        for pl in playlists:
+            enc_url = urllib.parse.quote_plus(pl['url'])
+            sanitized_url = f"{proxy_host}/playlist?url={enc_url}"
+            playlists_html += f"""
+            <div class="playlist-item">
+                <strong>{pl['name']}</strong>
+                <div class="result-url" onclick="navigator.clipboard.writeText('{sanitized_url}'); alert('Copied {pl['name']} link!');">{sanitized_url}</div>
+            </div>
+            """
 
     html_content = f"""
     <!DOCTYPE html>
@@ -104,11 +123,12 @@ async def web_ui(source: str = Query(None)):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>FAST Stream Sanitizer</title>
+        <title>Stream-Sanatizarr Dashboard</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121214; color: #e1e1e6; padding: 40px 20px; max-width: 650px; margin: 0 auto; }}
             .container {{ background: #1d1d22; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); border: 1px solid #29292e; }}
             h1 {{ margin-top: 0; color: #4fffaf; font-size: 24px; }}
+            h3 {{ margin-top: 25px; border-bottom: 1px solid #29292e; padding-bottom: 8px; color: #fff; }}
             p {{ color: #a8a8b3; font-size: 14px; line-height: 1.5; }}
             label {{ display: block; margin-bottom: 8px; font-weight: 600; font-size: 14px; }}
             input[type="url"] {{ width: 100%; padding: 12px; border: 1px solid #29292e; background: #121214; color: #fff; border-radius: 4px; box-sizing: border-box; font-size: 14px; margin-bottom: 15px; }}
@@ -116,6 +136,8 @@ async def web_ui(source: str = Query(None)):
             button {{ background: #4fffaf; color: #000; border: none; padding: 12px 20px; font-weight: bold; border-radius: 4px; cursor: pointer; font-size: 14px; width: 100%; transition: background 0.2s; }}
             button:hover {{ background: #3ae099; }}
             .result-box {{ margin-top: 25px; padding: 15px; background: #121214; border-radius: 4px; border-left: 4px solid #4fffaf; }}
+            .playlist-item {{ background: #121214; padding: 12px; border-radius: 6px; margin-bottom: 12px; border: 1px solid #29292e; }}
+            .playlist-item strong {{ display: block; margin-bottom: 6px; font-size: 14px; color: #fff; }}
             .result-title {{ font-weight: bold; font-size: 12px; color: #a8a8b3; text-transform: uppercase; margin-bottom: 8px; }}
             .result-url {{ font-family: monospace; word-break: break-all; background: #29292e; padding: 10px; border-radius: 4px; font-size: 13px; color: #4fffaf; user-select: all; cursor: pointer; }}
             .copy-hint {{ font-size: 11px; color: #737380; margin-top: 5px; }}
@@ -123,8 +145,8 @@ async def web_ui(source: str = Query(None)):
     </head>
     <body>
         <div class="container">
-            <h1>FAST Stream Sanitizer Proxy</h1>
-            <p>Paste your raw Pluto TV, Local Now, or alternative FAST source M3U playlist URL below to wrap it with the stabilization engine layer.</p>
+            <h1>Stream-Sanatizarr</h1>
+            <p>Paste a raw FAST M3U playlist URL below to wrap it with the stabilization engine layer.</p>
             
             <form method="get" action="/">
                 <label for="source">Source M3U Playlist URL:</label>
@@ -134,11 +156,13 @@ async def web_ui(source: str = Query(None)):
 
             {f'''
             <div class="result-box">
-                <div class="result-title">Copy & Paste this URL into Dispatcharr:</div>
-                <div class="result-url" id="outputUrl" onclick="navigator.clipboard.writeText(this.innerText); alert('Copied to clipboard!');">{generated_url}</div>
-                <div class="copy-hint">💡 Click the link above to instantly copy it.</div>
+                <div class="result-title">Generated Link for Dispatcharr:</div>
+                <div class="result-url" onclick="navigator.clipboard.writeText(this.innerText); alert('Copied!');">{generated_url}</div>
+                <div class="copy-hint">💡 Click the link above to copy it.</div>
             </div>
             ''' if generated_url else ''}
+
+            {playlists_html}
         </div>
     </body>
     </html>
@@ -149,7 +173,7 @@ async def web_ui(source: str = Query(None)):
 async def stream_proxy(url: str):
     if not url:
         raise HTTPException(status_code=400, detail="Missing required 'url' parameter.")
-    logger.info(f"Received stream request for raw URL: {url}")
+    # Use standard raw query string extraction to capture multi-parameter tokens seamlessly
     return StreamingResponse(ffmpeg_stream_generator(url), media_type="video/mp2t")
 
 @app.get("/playlist")
@@ -157,12 +181,10 @@ async def playlist_proxy(url: str):
     if not url:
         raise HTTPException(status_code=400, detail="Missing required 'url' parameter.")
     try:
-        logger.info(f"Fetching raw source playlist from: {url}")
         response = requests.get(url, timeout=15)
         response.raise_for_status()
         raw_m3u = response.text
     except Exception as e:
-        logger.error(f"Failed to fetch source playlist: {e}")
         raise HTTPException(status_code=502, detail=f"Failed to fetch source playlist: {e}")
 
     proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://localhost:8089").rstrip("/")
@@ -171,6 +193,7 @@ async def playlist_proxy(url: str):
     for line in raw_m3u.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
+            # FIX: Safely encodes nested parameters (& token=... & pl=...) 
             encoded_url = urllib.parse.quote_plus(line)
             sanitized_line = f"{proxy_host}/stream?url={encoded_url}"
             sanitized_lines.append(sanitized_line)
