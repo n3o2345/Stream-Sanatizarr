@@ -10,7 +10,7 @@ on:
 
 env:
   # Updated target image repository name
-  IMAGE: ghcr.io/${{ github.repository_owner }}/stream-sanitizarr
+  IMAGE: ghcr.io/${{ github.repository_owner }}/stream-sanatizarr
 
 jobs:
   build-and-push:
@@ -35,7 +35,7 @@ jobs:
       - name: Build image
         run: |
           docker build \
-            --label "org.opencontainers.image.title=stream-sanitizer" \
+            --label "org.opencontainers.image.title=stream-sanatizer" \
             --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
             --label "org.opencontainers.image.revision=${{ github.sha }}" \
             -t ${{ env.IMAGE }}:${{ github.sha }} \
