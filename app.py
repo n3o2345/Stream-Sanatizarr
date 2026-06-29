@@ -14,24 +14,84 @@ app = FastAPI(title="FAST Stream Sanitizer Proxy")
 VIDEO_CODEC = os.getenv("VIDEO_CODEC", "libx264")  
 VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "3000k")
 AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
+STREAM_USER_AGENT = os.getenv(
+    "STREAM_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+)
+PROBE_TIMEOUT = float(os.getenv("PROBE_TIMEOUT", "10"))
 
-async def ffmpeg_stream_generator(stream_url: str):
+
+async def probe_stream(stream_url: str) -> dict:
+    """Probe the source with ffprobe to find out what's actually in it
+    (video present?, audio present?) so the ffmpeg command can be built
+    to match instead of assuming a fixed video+stereo-audio layout."""
+    info = {"has_video": True, "has_audio": True}
+
+    ffprobe_cmd = [
+        "ffprobe",
+        "-nostdin",
+        "-loglevel", "error",
+        "-user_agent", STREAM_USER_AGENT,
+        "-print_format", "json",
+        "-show_streams",
+        stream_url,
+    ]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *ffprobe_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=PROBE_TIMEOUT)
+
+        if proc.returncode != 0:
+            logger.warning(f"ffprobe exited {proc.returncode}: {stderr.decode(errors='ignore').strip()}")
+            return info
+
+        import json
+        data = json.loads(stdout.decode(errors="ignore") or "{}")
+        streams = data.get("streams", [])
+
+        video_streams = [s for s in streams if s.get("codec_type") == "video"]
+        audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+
+        info["has_video"] = bool(video_streams)
+        info["has_audio"] = bool(audio_streams)
+
+        logger.info(
+            f"Probe result for {stream_url}: video={info['has_video']} audio={info['has_audio']}"
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"ffprobe timed out after {PROBE_TIMEOUT}s, assuming standard layout.")
+    except Exception as e:
+        logger.warning(f"ffprobe failed ({e}), assuming standard layout.")
+
+    return info
+
+
+def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
     try:
         clean_bitrate = "".join(c for c in VIDEO_BITRATE if c.isdigit())
         bitrate_int = int(clean_bitrate) if clean_bitrate else 3000
     except Exception:
         bitrate_int = 3000
-        
+
     bufsize_str = f"{bitrate_int * 2}k"
 
     ffmpeg_cmd = [
         "ffmpeg",
         "-nostdin",
+        "-loglevel", "warning",
+        "-analyzeduration", "10000000",
+        "-probesize", "10000000",
+        "-user_agent", STREAM_USER_AGENT,
         "-reconnect", "1",
         "-reconnect_at_eof", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "5",
-        "-fflags", "+genpts",
+        "-fflags", "+genpts+discardcorrupt",
         "-avoid_negative_ts", "make_zero",
     ]
 
@@ -41,10 +101,19 @@ async def ffmpeg_stream_generator(stream_url: str):
     else:
         vf_filter = "scale=1280:720,fps=30"
 
+    ffmpeg_cmd.extend(["-i", stream_url])
+
+    has_audio = probe.get("has_audio", True)
+
+    if not has_audio:
+        # No audio track in the source at all - synthesize a silent one so
+        # downstream players/Dispatcharr that expect an audio PID don't choke.
+        ffmpeg_cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
+
+    ffmpeg_cmd.extend(["-map", "0:v:0"])
+    ffmpeg_cmd.extend(["-map", "1:a:0" if not has_audio else "0:a:0?"])
+
     ffmpeg_cmd.extend([
-        "-i", stream_url,
-        "-map", "0:v:0",
-        "-map", "0:a:0",
         "-c:v", VIDEO_CODEC,
         "-vf", vf_filter,
         "-vsync", "cfr",
@@ -56,10 +125,17 @@ async def ffmpeg_stream_generator(stream_url: str):
         "-ar", "48000",
         "-b:a", AUDIO_BITRATE,
         "-f", "mpegts",
-        "pipe:1"
+        "pipe:1",
     ])
 
+    return ffmpeg_cmd
+
+
+async def ffmpeg_stream_generator(stream_url: str):
+    probe = await probe_stream(stream_url)
+
     while True:
+        ffmpeg_cmd = build_ffmpeg_cmd(stream_url, probe)
         logger.info(f"Spawning FFmpeg worker for stream: {stream_url}")
         process = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
