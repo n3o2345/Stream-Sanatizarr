@@ -3,8 +3,8 @@ import logging
 import os
 import urllib.parse
 import requests
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Response, Query
+from fastapi.responses import StreamingResponse, HTMLResponse
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -32,28 +32,21 @@ async def ffmpeg_stream_generator(stream_url: str):
         "-avoid_negative_ts", "make_zero",
     ]
 
-    # Required initialization parameter ONLY if using generic VAAPI (AMD/Intel)
     if VIDEO_CODEC == "h264_vaapi":
         ffmpeg_cmd.extend(["-vaapi_device", "/dev/dri/renderD128"])
 
     ffmpeg_cmd.extend([
         "-i", stream_url,
-        
-        # Video Normalization
         "-c:v", VIDEO_CODEC,
         "-vf", "scale=1280:720,fps=30",
         "-vsync", "cfr",
         "-b:v", VIDEO_BITRATE,
         "-maxrate:v", VIDEO_BITRATE,
         "-bufsize:v", f"{int(VIDEO_BITRATE.replace('k',''))*2}k",
-        
-        # Audio Normalization (Forces standard stereo AAC)
         "-c:a", "aac",
         "-ac", "2",
         "-ar", "48000",
         "-b:a", AUDIO_BITRATE,
-        
-        # Output Format
         "-f", "mpegts",
         "pipe:1"
     ])
@@ -68,7 +61,7 @@ async def ffmpeg_stream_generator(stream_url: str):
 
         try:
             while True:
-                chunk = await process.stdout.read(65536) # 64KB chunks
+                chunk = await process.stdout.read(65536)
                 if not chunk:
                     break
                 yield chunk
@@ -93,26 +86,76 @@ async def ffmpeg_stream_generator(stream_url: str):
         logger.warning("Upstream stream disconnected/shifted. Re-spawning worker in 1 second...")
         await asyncio.sleep(1)
 
+@app.get("/", response_class=HTMLResponse)
+async def web_ui(source: str = Query(None)):
+    """
+    Serves a simple web interface to generate sanitized M3U links.
+    """
+    proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://localhost:8089").rstrip("/")
+    generated_url = ""
+    
+    if source:
+        encoded_source = urllib.parse.quote_plus(source.strip())
+        generated_url = f"{proxy_host}/playlist?url={encoded_source}"
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>FAST Stream Sanitizer</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121214; color: #e1e1e6; padding: 40px 20px; max-width: 650px; margin: 0 auto; }}
+            .container {{ background: #1d1d22; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); border: 1px solid #29292e; }}
+            h1 {{ margin-top: 0; color: #4fffaf; font-size: 24px; }}
+            p {{ color: #a8a8b3; font-size: 14px; line-height: 1.5; }}
+            label {{ display: block; margin-bottom: 8px; font-weight: 600; font-size: 14px; }}
+            input[type="url"] {{ width: 100%; padding: 12px; border: 1px solid #29292e; background: #121214; color: #fff; border-radius: 4px; box-sizing: border-box; font-size: 14px; margin-bottom: 15px; }}
+            input[type="url"]:focus {{ border-color: #4fffaf; outline: none; }}
+            button {{ background: #4fffaf; color: #000; border: none; padding: 12px 20px; font-weight: bold; border-radius: 4px; cursor: pointer; font-size: 14px; width: 100%; transition: background 0.2s; }}
+            button:hover {{ background: #3ae099; }}
+            .result-box {{ margin-top: 25px; padding: 15px; background: #121214; border-radius: 4px; border-left: 4px solid #4fffaf; }}
+            .result-title {{ font-weight: bold; font-size: 12px; color: #a8a8b3; text-transform: uppercase; margin-bottom: 8px; }}
+            .result-url {{ font-family: monospace; word-break: break-all; background: #29292e; padding: 10px; border-radius: 4px; font-size: 13px; color: #4fffaf; user-select: all; cursor: pointer; }}
+            .copy-hint {{ font-size: 11px; color: #737380; margin-top: 5px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>FAST Stream Sanitizer Proxy</h1>
+            <p>Paste your raw Pluto TV, Local Now, or alternative FAST source M3U playlist URL below to wrap it with the stabilization engine layer.</p>
+            
+            <form method="get" action="/">
+                <label for="source">Source M3U Playlist URL:</label>
+                <input type="url" id="source" name="source" placeholder="https://example.com/source.m3u" value="{source or ''}" required autocomplete="off">
+                <button type="submit">Generate Sanitized URL</button>
+            </form>
+
+            {f'''
+            <div class="result-box">
+                <div class="result-title">Copy & Paste this URL into Dispatcharr:</div>
+                <div class="result-url" id="outputUrl" onclick="navigator.clipboard.writeText(this.innerText); alert('Copied to clipboard!');">{generated_url}</div>
+                <div class="copy-hint">💡 Click the link above to instantly copy it.</div>
+            </div>
+            ''' if generated_url else ''}
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
 @app.get("/stream")
 async def stream_proxy(url: str):
     if not url:
         raise HTTPException(status_code=400, detail="Missing required 'url' parameter.")
-    
     logger.info(f"Received stream request for raw URL: {url}")
-    return StreamingResponse(
-        ffmpeg_stream_generator(url),
-        media_type="video/mp2t"
-    )
+    return StreamingResponse(ffmpeg_stream_generator(url), media_type="video/mp2t")
 
 @app.get("/playlist")
 async def playlist_proxy(url: str):
-    """
-    Fetches a remote source M3U playlist and rewrites all channel stream URLs 
-    to route through this stabilizer proxy before heading to Dispatcharr.
-    """
     if not url:
         raise HTTPException(status_code=400, detail="Missing required 'url' parameter.")
-    
     try:
         logger.info(f"Fetching raw source playlist from: {url}")
         response = requests.get(url, timeout=15)
@@ -122,8 +165,7 @@ async def playlist_proxy(url: str):
         logger.error(f"Failed to fetch source playlist: {e}")
         raise HTTPException(status_code=502, detail=f"Failed to fetch source playlist: {e}")
 
-    # Set your host URL environment parameter dynamically
-    proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://localhost:8089")
+    proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://localhost:8089").rstrip("/")
     sanitized_lines = []
     
     for line in raw_m3u.splitlines():
