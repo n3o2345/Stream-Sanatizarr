@@ -205,11 +205,13 @@ async def playlist_proxy(url: str):
             # Some upstream playlist sources hand back stream URLs that are
             # already partially percent-encoded (e.g. a redirect param
             # embedded as "%3Fslug%3Dalf" inside an otherwise-raw URL).
-            # Decoding first collapses any pre-existing encoding down to
-            # raw characters, so quote_plus() below always applies exactly
-            # one consistent layer of encoding instead of double-escaping
-            # whatever the source already encoded.
-            normalized_line = urllib.parse.unquote_plus(line)
+            # Use plain unquote() (NOT unquote_plus) here - unquote_plus
+            # would also treat any literal '+' character in a token as an
+            # encoded space and corrupt it. Decoding %XX sequences only
+            # collapses any pre-existing encoding down to raw characters,
+            # so quote_plus() below applies exactly one consistent layer
+            # of encoding instead of double-escaping what the source sent.
+            normalized_line = urllib.parse.unquote(line)
             encoded_url = urllib.parse.quote_plus(normalized_line)
             sanitized_line = f"{proxy_host}/stream?url={encoded_url}"
             sanitized_lines.append(sanitized_line)
