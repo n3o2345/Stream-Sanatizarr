@@ -1,5 +1,7 @@
 # Stream-Sanatizarr
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+
 A tiny self-hosted proxy that sits between a flaky live/FAST‑channel M3U playlist (Pluto TV, LocalNow, etc.) and your media player (Dispatcharr, Plex, Jellyfin, etc.), and "sanitizes" every stream in it by re-encoding it through FFmpeg in real time.
 
 Live FAST channels are notorious for things that break players: timestamp jumps across ad/SSAI breaks, variable framerates, mixed codecs, and broken reconnects. Stream-Sanatizarr fixes this by transcoding each stream to a clean, constant-framerate MPEG-TS feed with sane timestamps — and it does this **on the fly, per-channel**, so you don't need to pre-process anything.
@@ -28,18 +30,41 @@ Live FAST channels are notorious for things that break players: timestamp jumps 
 
 ## Quick start (Docker Compose)
 
+This repo's GitHub Action automatically builds and pushes an image to GHCR (`ghcr.io/n3o2345/stream-sanatizarr`) on every push to `main`. The provided `docker-compose.yml` pulls that prebuilt image rather than building locally.
+
 1. Clone this repo and `cd` into it.
-2. Edit `docker-compose.yml`:
-   - Set `PROXY_PUBLIC_URL` to the address other devices on your network will use to reach this container (e.g. `http://192.168.1.50:8089`).
-   - Pick the `VIDEO_CODEC` that matches your hardware (see [Hardware acceleration](#hardware-acceleration) below).
-3. Start it:
+2. If the GHCR package is private, log in first so Docker can pull it:
 
    ```bash
-   docker compose up -d --build
+   echo "<your-github-PAT>" | docker login ghcr.io -u <your-github-username> --password-stdin
    ```
 
-4. Open `http://<your-server>:8089/` in a browser, paste your source M3U playlist URL into the dashboard, and click **Generate Sanitized URL**.
-5. Add the generated URL as an M3U source in Dispatcharr (or your player of choice).
+   (Personal Access Token needs `read:packages` scope. Skip this step if you've made the package public in GitHub → Packages → Package settings.)
+
+3. Edit `docker-compose.yml`:
+   - Set `PROXY_PUBLIC_URL` to the address other devices on your network will use to reach this container (e.g. `http://192.168.1.50:8089`).
+   - Pick the `VIDEO_CODEC` that matches your hardware (see [Hardware acceleration](#hardware-acceleration) below).
+4. Pull and start it:
+
+   ```bash
+   docker compose pull
+   docker compose up -d
+   ```
+
+5. Open `http://<your-server>:8089/` in a browser, paste your source M3U playlist URL into the dashboard, and click **Generate Sanitized URL**.
+6. Add the generated URL as an M3U source in Dispatcharr (or your player of choice).
+
+> **Updating:** the `:latest` tag won't auto-refresh. After a new build lands on GHCR, run `docker compose pull && docker compose up -d` again to pick it up.
+
+### Building locally instead
+
+If you'd rather build the image yourself instead of pulling from GHCR (e.g. for local testing or development), swap the `image:` line in `docker-compose.yml` back to:
+
+```yaml
+build: .
+```
+
+then run `docker compose up -d --build`. No `Dockerfile` changes are needed regardless of which GPU vendor you're targeting — see [Hardware acceleration](#hardware-acceleration) below.
 
 ## Manual usage (no UI)
 
@@ -65,11 +90,20 @@ All configuration is via environment variables (set them in `docker-compose.yml`
 
 ### Hardware acceleration
 
-Pick **one** codec/hardware combination and update both files:
+The published image is **universal** — one build supports NVIDIA NVENC, Intel QuickSync (QSV), AMD/Intel VAAPI, and CPU-only `libx264`. You don't need to rebuild or change the `Dockerfile` to switch hardware; you only need to edit `docker-compose.yml`:
 
-- **NVIDIA (NVENC)** — default. Uses the `nvidia/cuda` base image. Requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed on the host and the `deploy.resources.reservations.devices` block in `docker-compose.yml` (already included by default).
-- **Intel QuickSync (`h264_qsv`)** or **AMD/Intel VAAPI (`h264_vaapi`)** — switch the base image in the `Dockerfile` to plain `ubuntu:22.04`, set `VIDEO_CODEC` accordingly, and uncomment the `devices: - /dev/dri:/dev/dri` line in `docker-compose.yml` (and remove/comment the NVIDIA `deploy:` block).
-- **CPU only (`libx264`)** — works anywhere, no special host setup needed, but uses significantly more CPU per stream than hardware encoding.
+1. Set `VIDEO_CODEC` to match your hardware.
+2. Set the matching device mapping block (see the comments in `docker-compose.yml` — Option A/B/C).
+3. Make sure your **host** has the right driver/runtime set up:
+
+| Platform | Codec | Host requirement |
+|---|---|---|
+| NVIDIA | `h264_nvenc` | [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed, GPU drivers present on host. Use the `deploy.resources.reservations.devices` block (Option A). |
+| Intel (QuickSync) | `h264_qsv` | `/dev/dri` render node present on host with the right permissions. Use the `devices: - /dev/dri:/dev/dri` mapping (Option B). |
+| AMD / generic VAAPI | `h264_vaapi` | Same as above — `/dev/dri` mapping (Option B). |
+| CPU only | `libx264` | No special host setup. No device mapping needed (Option C) — works anywhere, but uses significantly more CPU per stream than hardware encoding. |
+
+Only **one** hardware mapping block in `docker-compose.yml` should be active at a time — comment out the ones you're not using.
 
 ## Endpoints
 
@@ -91,7 +125,10 @@ Pick **one** codec/hardware combination and update both files:
 - **Player can't reach the proxy / playlist links are wrong** — double check `PROXY_PUBLIC_URL` matches an address that your *player*, not just the container, can reach.
 - **Choppy/garbled video with VAAPI** — confirm `/dev/dri` is actually being passed through and that the in-container user has permission to access it.
 - **High CPU usage** — you're likely falling back to `libx264`. Confirm your `VIDEO_CODEC` and host GPU/driver setup are correct; check FFmpeg debug logs for "no such device" or similar hardware errors.
+- **NVENC fails / "Cannot load nvcuvid" or similar** — confirm the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) is installed on the **host** (not just drivers) and that the `deploy.resources.reservations.devices` block in `docker-compose.yml` is uncommented and active. Run `docker exec stream-sanitizer nvidia-smi` — if that fails inside the container, the toolkit isn't wired up correctly on the host.
 
 ## License
 
-No license file is currently included — add one (MIT, GPL, etc.) before distributing publicly if you intend others to use/modify this freely.
+This project is licensed under the [GNU General Public License v3.0](LICENSE) (GPLv3).
+
+In short: you're free to use, modify, and distribute this software, but any distributed copies or derivative works must also be licensed under GPLv3, must include the source code, and must preserve copyright/license notices. See the [`LICENSE`](LICENSE) file for the full terms, or read the canonical text at <https://www.gnu.org/licenses/gpl-3.0.html>.

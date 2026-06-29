@@ -1,8 +1,12 @@
 version: '3.8'
 
+# NOTE: the image is now universal — it supports NVIDIA, Intel, AMD, and
+# CPU-only encoding from the SAME build. You only need to edit this file
+# (codec + device mapping) when switching hardware, no image rebuild needed.
+
 services:
   stream-sanitizer:
-    build: .
+    image: ghcr.io/n3o2345/stream-sanatizarr:latest
     container_name: stream-sanitizer
     ports:
       - "8089:8000"
@@ -20,9 +24,10 @@ services:
       # Replace with your actual server IP so the playlist generator builds the correct links
       - PROXY_PUBLIC_URL=http://192.168.1.50:8089 
     
-    # --- 3. HARDWARE MAPPING (Choose your hardware block) ---
+    # --- 3. HARDWARE MAPPING (Choose ONE block below to match VIDEO_CODEC above) ---
 
-    # Option A: NVIDIA Pass-through (Leave uncommented if using NVIDIA)
+    # Option A: NVIDIA (h264_nvenc) — Leave uncommented if using NVIDIA.
+    # Requires the NVIDIA Container Toolkit installed on the host.
     deploy:
       resources:
         reservations:
@@ -31,8 +36,12 @@ services:
               count: all
               capabilities: [gpu, video]
 
-    # Option B: Intel or AMD Direct Rendering Nodes (Uncomment below if using Intel/AMD)
+    # Option B: Intel QSV (h264_qsv) or AMD/Intel VAAPI (h264_vaapi) —
+    # comment out the entire "deploy:" block above, then uncomment below.
     # devices:
     #   - /dev/dri:/dev/dri
+
+    # Option C: CPU only (libx264) — comment out BOTH the "deploy:" block
+    # above and the "devices:" block above. No hardware mapping needed.
 
     restart: unless-stopped
