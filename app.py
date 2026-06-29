@@ -297,13 +297,18 @@ async def stream_proxy(request: Request):
     
     target_url = raw_query[4:]
     # Use unquote_plus to match the quote_plus() encoding used when the
-    # playlist URL was generated.
+    # playlist URL was generated (quote_plus turns spaces into '+').
     target_url = urllib.parse.unquote_plus(target_url)
 
     if not target_url:
         raise HTTPException(status_code=400, detail="Target stream URL payload is empty.")
 
-    # Fix formatting rules for double question marks in downstream query strings.
+    # Some upstream URLs (e.g. Dispatcharr LocalNow) embed a percent-encoded
+    # query string inside the path segment - e.g. localnow%3A%2F%2FGUID%3Fslug%3Dalf
+    # After unquote_plus the %3F becomes a literal '?' producing a double-'?' URL
+    # (path?slug=alf?token=...) that FFmpeg rejects as invalid.
+    # Fix: partition on the FIRST '?' only (the real query string), then
+    # turn any rogue subsequent '?' inside the query parameters into standard '&'.
     if target_url.count('?') > 1:
         path_part, sep, qs_part = target_url.partition('?')
         qs_part = qs_part.replace('?', '&')
@@ -333,8 +338,8 @@ async def playlist_proxy(url: str):
         line = line.strip()
         if line and not line.startswith("#"):
             # Do NOT use unquote() here anymore. We must preserve internal upstream path 
-            # encoding (like Dispatcharr's embedded sub-tokens) intact so they 
-            # decode properly when requested through our /stream route.
+            # encoding (like Masqueradarr/Dispatcharr's embedded parameters) intact so they 
+            # don't get flattened prematurely and break downstream routing.
             encoded_url = urllib.parse.quote_plus(line)
             sanitized_line = f"{proxy_host}/stream?url={encoded_url}"
             sanitized_lines.append(sanitized_line)
