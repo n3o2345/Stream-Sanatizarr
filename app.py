@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import urllib.parse
-import requests
+import httpx
 from fastapi import FastAPI, HTTPException, Response, Query, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
 
@@ -18,6 +18,7 @@ AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 async def ffmpeg_stream_generator(stream_url: str):
     ffmpeg_cmd = [
         "ffmpeg",
+        "-nostdin",                     # Prevents interactive prompts from dropping execution
         "-reconnect", "1",
         "-reconnect_at_eof", "1",
         "-reconnect_streamed", "1",
@@ -31,6 +32,8 @@ async def ffmpeg_stream_generator(stream_url: str):
 
     ffmpeg_cmd.extend([
         "-i", stream_url,
+        "-map", "0:v:0",                # Explicitly pass only the primary video track
+        "-map", "0:a:0",                # Explicitly pass only the primary audio track
         "-c:v", VIDEO_CODEC,
         "-vf", "scale=1280:720,fps=30",
         "-vsync", "cfr",
@@ -82,7 +85,7 @@ async def ffmpeg_stream_generator(stream_url: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def web_ui(source: str = Query(None)):
-    proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://localhost:8089").rstrip("/")
+    proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://localhost:8000").rstrip("/")
     
     predefined_env = os.getenv("PREDEFINED_PLAYLISTS", "")
     playlists = []
@@ -164,20 +167,13 @@ async def web_ui(source: str = Query(None)):
 
 @app.get("/stream")
 async def stream_proxy(request: Request):
-    """
-    Extracts the full raw bytes scope directly from the ASGI server layer
-    to prevent broken parameter mapping on complex nested query string tags.
-    """
     raw_query_bytes = request.scope.get("query_string", b"")
     raw_query = raw_query_bytes.decode("utf-8")
     
     if not raw_query.startswith("url="):
         raise HTTPException(status_code=400, detail="Missing target URL token prefix.")
     
-    # Grab absolutely everything after 'url=' completely intact
     target_url = raw_query[4:]
-    
-    # Unquote twice to cleanly clean double-wrapped symbols (%253F -> %3F -> ?)
     target_url = urllib.parse.unquote(target_url)
     target_url = urllib.parse.unquote(target_url)
     
@@ -191,14 +187,17 @@ async def stream_proxy(request: Request):
 async def playlist_proxy(url: str):
     if not url:
         raise HTTPException(status_code=400, detail="Missing required 'url' parameter.")
+    
     try:
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        raw_m3u = response.text
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            raw_m3u = response.text
     except Exception as e:
+        logger.error(f"Failed to reach upstream M3U file: {e}")
         raise HTTPException(status_code=502, detail=f"Failed to fetch source playlist: {e}")
 
-    proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://localhost:8089").rstrip("/")
+    proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://localhost:8000").rstrip("/")
     sanitized_lines = []
     
     for line in raw_m3u.splitlines():
@@ -210,8 +209,4 @@ async def playlist_proxy(url: str):
         else:
             sanitized_lines.append(line)
             
-    return Response(content="\n".join(sanitized_lines), media_type="application/x-mpegurl")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return Response(content="\n".join(sanitized_lines), media_type
