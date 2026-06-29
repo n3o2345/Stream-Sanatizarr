@@ -73,7 +73,7 @@ async def ffmpeg_stream_generator(stream_url: str):
                 async for line in proc.stderr:
                     decoded = line.decode(errors="ignore").strip()
                     if decoded:
-                        logger.debug(f"[ffmpeg] {decoded}")
+                        logger.warning(f"[ffmpeg] {decoded}")
             except Exception:
                 pass
 
