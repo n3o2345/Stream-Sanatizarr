@@ -116,10 +116,17 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         vf_filter = f"scale=1280:720,fps={OUTPUT_FPS},format=yuv420p"
 
     if has_video:
-        ffmpeg_cmd.extend(["-i", stream_url])
+        # -re paces reading of this input at its native/real-time rate.
+        # Without it, if the upstream delivers data faster than real-time
+        # (observed here: ffmpeg sustaining 2x+ speed for 100+ seconds
+        # rather than briefly catching up and settling near 1x), ffmpeg
+        # processes and emits output in bursts rather than smooth
+        # real-time flow, which downstream clients perceive as jittery/
+        # choppy playback even though no actual errors are occurring.
+        ffmpeg_cmd.extend(["-re", "-i", stream_url])
     else:
         ffmpeg_cmd.extend(["-f", "lavfi", "-i", f"color=c=black:s=1280x720:r={OUTPUT_FPS}"])
-        ffmpeg_cmd.extend(["-i", stream_url])
+        ffmpeg_cmd.extend(["-re", "-i", stream_url])
 
     if not has_audio:
         ffmpeg_cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
