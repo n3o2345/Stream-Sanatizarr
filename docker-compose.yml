@@ -22,7 +22,7 @@ services:
       
       # --- 2. THE STABILIZER'S NETWORK ADDRESS ---
       # Replace with your actual server IP so the playlist generator builds the correct links
-      - PROXY_PUBLIC_URL=http://192.168.1.50:8089 
+      - PROXY_PUBLIC_URL=http://{your-ip}:8089 
     
     # --- 3. HARDWARE MAPPING (Choose ONE block below to match VIDEO_CODEC above) ---
 
