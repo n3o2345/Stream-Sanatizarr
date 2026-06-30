@@ -31,7 +31,7 @@ PROBE_TIMEOUT = float(os.getenv("PROBE_TIMEOUT", "10"))
 # isn't coming. Left unhandled, this produces the freeze-then-burst-catchup
 # pattern (a long visible freeze, then a jerky dump of buffered frames once
 # the source resumes) instead of a clean, fast respawn.
-STALL_TIMEOUT = float(os.getenv("STALL_TIMEOUT", "8"))
+STALL_TIMEOUT = float(os.getenv("STALL_TIMEOUT", "5"))
 
 # How many recent chunks to keep in memory per channel so that a newly
 # connecting client (or Dispatcharr's buffer-fill phase) gets a small
@@ -186,14 +186,26 @@ class ChannelBroker:
             else:
                 logger.warning(f"[broker] Upstream disconnected for {url}. Re-spawning...")
 
-            # Some upstreams (e.g. masqueradarr's LocalNow handler) run their
-            # own internal capture engine (cvlc) that takes a few seconds to
-            # spin up and has its own idle-timeout/teardown logic. Retrying
-            # after only 1 second can land right in that engine's cold-start
-            # or teardown window, producing a flapping cycle of 502s/empty
-            # reads. A few seconds of breathing room avoids hammering a slow
-            # upstream mid-restart.
-            await asyncio.sleep(4)
+            # Whether to sleep before the next ffmpeg attempt depends on
+            # whether live clients are still waiting:
+            #
+            # HOT RESPAWN (clients still connected): sleep as briefly as
+            # possible (1s). Every second we sleep is a second of silence
+            # draining Dispatcharr's buffer. The 4s sleep was originally
+            # added for Masqueradarr's LocalNow/cvlc engine which needs
+            # breathing room after its internal capture engine tears down.
+            # But if clients are already timing out, sleeping longer just
+            # guarantees they disconnect before we restart. If Masqueradarr
+            # isn't ready yet, ffmpeg will fail fast and we'll retry again.
+            #
+            # COLD RESPAWN (no clients): broker will cancel this task
+            # anyway when the last client leaves, so this path is rarely
+            # reached — but if it is (race between unsubscribe and here),
+            # keep the 4s grace period for cvlc's teardown/startup cycle.
+            clients_waiting = url in self._channels and len(self._channels[url]["queues"]) > 0
+            sleep_secs = 1 if clients_waiting else 4
+            logger.info(f"[broker] Respawn sleep {sleep_secs}s (clients_waiting={clients_waiting})")
+            await asyncio.sleep(sleep_secs)
 
 
 broker = ChannelBroker()
