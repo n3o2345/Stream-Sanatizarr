@@ -31,7 +31,21 @@ STREAM_USER_AGENT = os.getenv(
 # isn't coming. Left unhandled, this produces the freeze-then-burst-catchup
 # pattern (a long visible freeze, then a jerky dump of buffered frames once
 # the source resumes) instead of a clean, fast respawn.
-STALL_TIMEOUT = float(os.getenv("STALL_TIMEOUT", "5"))
+STALL_TIMEOUT = float(os.getenv("STALL_TIMEOUT", "15"))
+
+# IMPORTANT - this value is not arbitrary, raise it carefully if at all.
+# Observed live evidence (LocalNow/alf, 2026-06-30): the upstream went
+# silent for ~9s with the TCP connection still open (a normal ad-stitcher
+# pause, not a dead source). The old 5s timeout killed that healthy
+# process anyway. The respawn then had to wait ~15s for the next real
+# keyframe before producing any output (connecting mid-GOP always means
+# decoding garbage until the next IDR - see build_ffmpeg_cmd notes).
+# Net result: a 9s natural pause became a ~24s visible freeze, because
+# killing a still-connected process throws away its decoder context and
+# forces a fresh mid-GOP resync on top of the original gap. Waiting out
+# the pause costs nothing extra; respawning into it costs ~15s. So
+# STALL_TIMEOUT needs to comfortably exceed this source's normal pause
+# length, or every transient stitcher gap gets needlessly amplified.
 
 # Separate, longer watchdog for time-to-FIRST-byte. ffmpeg is configured
 # with -analyzeduration/-probesize 15000000 (15s) below, and Masqueradarr's
