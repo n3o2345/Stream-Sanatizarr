@@ -200,6 +200,19 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
     return ffmpeg_cmd
 
 
+# Maximum seconds of silence on ffmpeg's stdout before we treat the worker
+# as stalled and force a respawn. This covers the case where the upstream
+# (e.g. a Pluto TV ad-break stitching gap, or Masqueradarr's internal
+# engine pausing) goes quiet WITHOUT actually closing the TCP connection.
+# In that case ffmpeg stays alive and "connected" indefinitely, so none of
+# the -reconnect* flags or the existing "if not chunk: break" disconnect
+# detection ever fire - the read() call just blocks waiting for data that
+# isn't coming. Left unhandled, this produces the freeze-then-burst-catchup
+# pattern (a long visible freeze, then a jerky dump of buffered frames once
+# the source resumes) instead of a clean, fast respawn.
+STALL_TIMEOUT = float(os.getenv("STALL_TIMEOUT", "8"))
+
+
 async def ffmpeg_stream_generator(stream_url: str):
     probe = await probe_stream(stream_url)
 
@@ -223,10 +236,21 @@ async def ffmpeg_stream_generator(stream_url: str):
                 pass
 
         stderr_task = asyncio.create_task(_drain_stderr(process))
+        stalled = False
 
         try:
             while True:
-                chunk = await process.stdout.read(65536)
+                try:
+                    chunk = await asyncio.wait_for(
+                        process.stdout.read(65536), timeout=STALL_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"No data from FFmpeg stdout for {STALL_TIMEOUT}s "
+                        f"(upstream stall, connection still open). Forcing respawn."
+                    )
+                    stalled = True
+                    break
                 if not chunk:
                     break
                 yield chunk
@@ -248,8 +272,11 @@ async def ffmpeg_stream_generator(stream_url: str):
                 except ProcessLookupError:
                     pass
             stderr_task.cancel()
-        
-        logger.warning("Upstream stream disconnected. Re-spawning worker...")
+
+        if stalled:
+            logger.warning("Worker stalled (silent upstream). Re-spawning worker...")
+        else:
+            logger.warning("Upstream stream disconnected. Re-spawning worker...")
         # Some upstreams (e.g. masqueradarr's LocalNow handler) run their own
         # internal capture engine (cvlc) that takes a few seconds to spin up
         # and has its own idle-timeout/teardown logic. Retrying after only
