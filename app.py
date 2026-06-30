@@ -32,6 +32,16 @@ STREAM_USER_AGENT = os.getenv(
 # the source resumes) instead of a clean, fast respawn.
 STALL_TIMEOUT = float(os.getenv("STALL_TIMEOUT", "5"))
 
+# Separate, longer watchdog for time-to-FIRST-byte. ffmpeg is configured
+# with -analyzeduration/-probesize 15000000 (15s) below, and Masqueradarr's
+# own LocalNow/Pluto stitcher can take several seconds to start serving a
+# freshly-spawned session on top of that. Using STALL_TIMEOUT here too
+# would kill ffmpeg mid-analysis on every single connection attempt,
+# before it ever produces a byte - indistinguishable from a dead source.
+# Defaults a bit above the analyzeduration ceiling to leave room for
+# Masqueradarr's own startup latency.
+STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "20"))
+
 # How many recent chunks to keep in memory per channel so that a newly
 # connecting client (or Dispatcharr's buffer-fill phase) gets a small
 # burst of recent data immediately rather than waiting for the next chunk
@@ -167,22 +177,46 @@ class ChannelBroker:
             stderr_task = asyncio.create_task(_drain_stderr(process))
             stalled = False
             bytes_produced = 0
+            got_first_byte = False
 
             try:
                 while True:
                     try:
+                        # Time-to-first-byte gets a much longer leash than
+                        # the steady-state stall watchdog. ffmpeg is given
+                        # -analyzeduration/-probesize 15000000 (15s) to
+                        # analyze the input before it can emit anything on
+                        # stdout, and Masqueradarr's LocalNow/Pluto stitcher
+                        # can itself take several seconds to start serving
+                        # a freshly-spawned session. STALL_TIMEOUT (5s) is
+                        # tuned to catch a genuine mid-stream freeze on an
+                        # already-flowing connection - applying it to the
+                        # initial connect+analyze phase kills ffmpeg before
+                        # it ever has a chance to produce its first packet,
+                        # which looks identical to a dead source (zero
+                        # bytes, no ffmpeg error, repeating every respawn).
+                        read_timeout = STALL_TIMEOUT if got_first_byte else STARTUP_TIMEOUT
                         chunk = await asyncio.wait_for(
-                            process.stdout.read(65536), timeout=STALL_TIMEOUT
+                            process.stdout.read(65536), timeout=read_timeout
                         )
                     except asyncio.TimeoutError:
-                        logger.warning(
-                            f"[broker] No data from FFmpeg stdout for {STALL_TIMEOUT}s "
-                            f"(upstream stall, connection still open). Forcing respawn."
-                        )
+                        if got_first_byte:
+                            logger.warning(
+                                f"[broker] No data from FFmpeg stdout for {STALL_TIMEOUT}s "
+                                f"(upstream stall, connection still open). Forcing respawn."
+                            )
+                        else:
+                            logger.warning(
+                                f"[broker] No initial data from FFmpeg within {STARTUP_TIMEOUT}s "
+                                f"(startup/analyze phase never produced output). Forcing respawn."
+                            )
                         stalled = True
                         break
                     if not chunk:
                         break
+                    if not got_first_byte:
+                        got_first_byte = True
+                        logger.info(f"[broker] First output bytes received for {url}")
                     bytes_produced += len(chunk)
                     await self._broadcast(url, chunk)
             except asyncio.CancelledError:
