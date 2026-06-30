@@ -111,9 +111,21 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
 
     if VIDEO_CODEC == "h264_vaapi":
         ffmpeg_cmd.extend(["-vaapi_device", "/dev/dri/renderD128"])
-        vf_filter = f"scale=1280:720,fps={OUTPUT_FPS},format=nv12,hwupload"
+        # scale+pad (rather than a plain stretch-scale) preserves the
+        # source's aspect ratio and letterboxes/pillarboxes onto the fixed
+        # 1280x720 canvas instead of distorting non-16:9 sources (4:3,
+        # vertical, oddball aspect ratios some FAST sources serve).
+        vf_filter = (
+            f"scale=1280:720:force_original_aspect_ratio=decrease,"
+            f"pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"fps={OUTPUT_FPS},format=nv12,hwupload"
+        )
     else:
-        vf_filter = f"scale=1280:720,fps={OUTPUT_FPS},format=yuv420p"
+        vf_filter = (
+            f"scale=1280:720:force_original_aspect_ratio=decrease,"
+            f"pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"fps={OUTPUT_FPS},format=yuv420p"
+        )
 
     if has_video:
         # -re paces reading of this input at its native/real-time rate.
