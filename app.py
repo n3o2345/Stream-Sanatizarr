@@ -30,7 +30,6 @@ async def probe_stream(stream_url: str) -> dict:
         "ffprobe",
         "-nostdin",
         "-loglevel", "error",
-        "-no_subtitles", "1",          # Prevent ffprobe from looping on subtitles
         "-user_agent", STREAM_USER_AGENT,
         "-print_format", "json",
         "-show_streams",
@@ -86,9 +85,8 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         "-nostdin",
         "-loglevel", "warning",
         "-allowed_extensions", "ALL",  
-        "-no_subtitles", "1",          # FORCE the HLS demuxer to completely ignore subtitle manifests
-        "-sn",                         # Strip them out from output mapping block
-        "-dn",                         # Drop data stream tracking tracks
+        "-sn",                         # Strip subtitle streams from output mapping
+        "-dn",                         # Drop data stream tracks
         "-analyzeduration", "10000000",
         "-probesize", "10000000",
         "-user_agent", STREAM_USER_AGENT,
@@ -305,7 +303,18 @@ async def playlist_proxy(url: str):
     for line in raw_m3u.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            encoded_url = urllib.parse.quote(line, safe='')
+            # Collapse any pre-existing percent-encoding the SOURCE playlist
+            # already applied (e.g. LocalNow ships entries like
+            # "localnow%3A%2F%2FGUID%3Fslug%3Dalf" baked directly into the
+            # M3U). Without this, quote()'ing the raw line below would
+            # re-escape those literal '%' characters into '%25..', producing
+            # a DOUBLE-encoded URL that a single unquote() in /stream can't
+            # fully unwind - leaving mangled %3A/%2F sequences in the final
+            # URL handed to FFmpeg. Decoding first guarantees exactly one
+            # clean encoding layer gets applied, regardless of how the
+            # source already encoded (or didn't encode) the line.
+            normalized_line = urllib.parse.unquote(line)
+            encoded_url = urllib.parse.quote(normalized_line, safe='')
             sanitized_line = f"{proxy_host}/stream?url={encoded_url}"
             sanitized_lines.append(sanitized_line)
         else:
