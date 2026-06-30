@@ -85,8 +85,8 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         "-loglevel", "warning",
         "-sn",                         # Strip subtitle streams from output mapping
         "-dn",                         # Drop data stream tracks
-        "-analyzeduration", "10000000",
-        "-probesize", "10000000",
+        "-analyzeduration", "15000000",
+        "-probesize", "15000000",
         "-user_agent", STREAM_USER_AGENT,
         "-reconnect", "1",
         "-reconnect_at_eof", "1",
@@ -150,6 +150,15 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         "-mpegts_flags", "+resend_headers",
         "-muxdelay", "0",
         "-muxpreload", "0",
+        # Some live sources deliver audio/video packets at uneven, jittery
+        # rates relative to each other (common on HTTP/TS sources with
+        # separately-paced PIDs). Without enough queue depth, ffmpeg's
+        # muxer backs up waiting to interleave the slower stream's packets,
+        # producing escalating "buffers queued ... something may be wrong"
+        # warnings and an effective stall/no-output condition. Raising the
+        # allowed queue depth gives the muxer enough slack to absorb that
+        # jitter instead of stalling.
+        "-max_muxing_queue_size", "9999",
         "-f", "mpegts",
         "pipe:1",
     ])
