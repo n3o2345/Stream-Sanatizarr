@@ -123,6 +123,22 @@ class ChannelBroker:
         (all clients disconnected) or the outer task is explicitly cancelled."""
         probe = await probe_stream(url)
 
+        # Track how many consecutive attempts produced zero output bytes.
+        # When Masqueradarr's upstream CDN source is dead or the CDN feed
+        # is stuck mid-GOP, every respawn hits the same wall: a burst of
+        # undecodeable H.264 frames (missing SPS/PPS/IDR) then silence.
+        # Masqueradarr runs ffmpeg in remux/copy mode — it cannot inject
+        # IDR keyframes on connection, so every fresh connection lands
+        # mid-GOP by definition. If the CDN never sends a keyframe in our
+        # analysis window, ffmpeg produces zero output.
+        # Rapid-firing respawns hammer Masqueradarr while it may itself be
+        # mid-reconnect-cycle to the CDN (-reconnect_streamed is set in
+        # Masqueradarr's own ffmpeg command). Exponential backoff gives
+        # both Masqueradarr and the CDN time to stabilise, capping at
+        # MAX_BACKOFF so we recover quickly once the source comes back.
+        zero_output_streak = 0
+        MAX_BACKOFF = 60  # seconds
+
         while True:
             ffmpeg_cmd = build_ffmpeg_cmd(url, probe)
             logger.info(f"[broker] Spawning FFmpeg worker for stream: {url}")
@@ -144,6 +160,7 @@ class ChannelBroker:
 
             stderr_task = asyncio.create_task(_drain_stderr(process))
             stalled = False
+            bytes_produced = 0
 
             try:
                 while True:
@@ -160,6 +177,7 @@ class ChannelBroker:
                         break
                     if not chunk:
                         break
+                    bytes_produced += len(chunk)
                     await self._broadcast(url, chunk)
             except asyncio.CancelledError:
                 logger.info(f"[broker] Worker cancelled for {url} (no clients remain).")
@@ -186,25 +204,46 @@ class ChannelBroker:
             else:
                 logger.warning(f"[broker] Upstream disconnected for {url}. Re-spawning...")
 
-            # Whether to sleep before the next ffmpeg attempt depends on
-            # whether live clients are still waiting:
+            # Update zero-output streak for backoff calculation.
+            if bytes_produced == 0:
+                zero_output_streak += 1
+                logger.warning(
+                    f"[broker] Zero output streak: {zero_output_streak} "
+                    f"(upstream source may be dead or stuck mid-GOP)"
+                )
+            else:
+                if zero_output_streak > 0:
+                    logger.info(f"[broker] Upstream recovered after {zero_output_streak} zero-output attempts.")
+                zero_output_streak = 0
+
+            # Sleep before next attempt. Two factors:
             #
-            # HOT RESPAWN (clients still connected): sleep as briefly as
-            # possible (1s). Every second we sleep is a second of silence
-            # draining Dispatcharr's buffer. The 4s sleep was originally
-            # added for Masqueradarr's LocalNow/cvlc engine which needs
-            # breathing room after its internal capture engine tears down.
-            # But if clients are already timing out, sleeping longer just
-            # guarantees they disconnect before we restart. If Masqueradarr
-            # isn't ready yet, ffmpeg will fail fast and we'll retry again.
+            # 1. BACKOFF: if the upstream is consistently delivering nothing,
+            #    apply exponential backoff (2^streak seconds, capped at
+            #    MAX_BACKOFF) to stop hammering a dead source. A dead LocalNow
+            #    channel with rapid retries can interfere with Masqueradarr's own
+            #    restart cycle, making recovery take longer.
             #
-            # COLD RESPAWN (no clients): broker will cancel this task
-            # anyway when the last client leaves, so this path is rarely
-            # reached — but if it is (race between unsubscribe and here),
-            # keep the 4s grace period for cvlc's teardown/startup cycle.
+            # 2. HOT vs COLD: when clients are still connected, we want to
+            #    recover as fast as possible (minimum 1s base) since every
+            #    extra second is silence that drains Dispatcharr's buffer.
+            #    When no clients are waiting, use a 4s base to avoid
+            #    hammering Masqueradarr during its own CDN reconnect cycle.
             clients_waiting = url in self._channels and len(self._channels[url]["queues"]) > 0
-            sleep_secs = 1 if clients_waiting else 4
-            logger.info(f"[broker] Respawn sleep {sleep_secs}s (clients_waiting={clients_waiting})")
+            base_sleep = 1 if clients_waiting else 4
+
+            if zero_output_streak > 1:
+                # Exponential backoff starting on the second consecutive failure.
+                backoff = min(2 ** (zero_output_streak - 1), MAX_BACKOFF)
+                sleep_secs = backoff
+                logger.info(
+                    f"[broker] Backoff sleep {sleep_secs}s "
+                    f"(streak={zero_output_streak}, clients_waiting={clients_waiting})"
+                )
+            else:
+                sleep_secs = base_sleep
+                logger.info(f"[broker] Respawn sleep {sleep_secs}s (clients_waiting={clients_waiting})")
+
             await asyncio.sleep(sleep_secs)
 
 
