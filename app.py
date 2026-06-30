@@ -28,7 +28,6 @@ async def probe_stream(stream_url: str) -> dict:
 
     ffprobe_cmd = [
         "ffprobe",
-        "-nostdin",
         "-loglevel", "error",
         "-user_agent", STREAM_USER_AGENT,
         "-print_format", "json",
@@ -84,7 +83,6 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         "ffmpeg",
         "-nostdin",
         "-loglevel", "warning",
-        "-allowed_extensions", "ALL",  
         "-sn",                         # Strip subtitle streams from output mapping
         "-dn",                         # Drop data stream tracks
         "-analyzeduration", "10000000",
@@ -311,18 +309,29 @@ async def playlist_proxy(url: str):
     for line in raw_m3u.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            # Collapse any pre-existing percent-encoding the SOURCE playlist
-            # already applied (e.g. LocalNow ships entries like
-            # "localnow%3A%2F%2FGUID%3Fslug%3Dalf" baked directly into the
-            # M3U). Without this, quote()'ing the raw line below would
-            # re-escape those literal '%' characters into '%25..', producing
-            # a DOUBLE-encoded URL that a single unquote() in /stream can't
-            # fully unwind - leaving mangled %3A/%2F sequences in the final
-            # URL handed to FFmpeg. Decoding first guarantees exactly one
-            # clean encoding layer gets applied, regardless of how the
-            # source already encoded (or didn't encode) the line.
-            normalized_line = urllib.parse.unquote(line)
-            encoded_url = urllib.parse.quote(normalized_line, safe='')
+            # IMPORTANT: do NOT pre-decode (unquote) the line before encoding
+            # it here. Some upstream sources (e.g. masqueradarr's LocalNow
+            # handler) deliberately embed an ALREADY percent-encoded opaque
+            # token in the path - e.g. "localnow%3A%2F%2FGUID%3Fslug%3Dalf"
+            # followed by a genuine literal '?' separator for real query
+            # params (token=...&pl=...). Their router string-matches against
+            # that STILL-ENCODED path token, not its decoded form.
+            #
+            # Applying quote(line, safe='') directly here re-encodes the
+            # whole line one extra layer (turning the existing "%3A" into
+            # "%253A", and the genuine literal "?" into "%3F"). A single
+            # unquote() downstream in /stream then peels exactly one layer
+            # back off - which restores the path token to its ORIGINAL
+            # still-encoded form (e.g. back to "%3A"), while correctly
+            # restoring the one genuine literal "?" separator too. This
+            # round-trips back to exactly what the source intended.
+            #
+            # Pre-decoding with unquote() here (as a previous version of
+            # this code did) instead fully collapses the opaque path token
+            # into literal characters (e.g. "localnow://GUID"), which the
+            # upstream router then fails to match, producing a 502 Bad
+            # Gateway. Do not reintroduce that pre-decode step.
+            encoded_url = urllib.parse.quote(line, safe='')
             sanitized_line = f"{proxy_host}/stream?url={encoded_url}"
             sanitized_lines.append(sanitized_line)
         else:
