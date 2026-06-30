@@ -354,16 +354,26 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         )
 
     if has_video:
-        # -re paces reading of this input at its native/real-time rate.
-        # Without it, if the upstream delivers data faster than real-time
-        # (observed: ffmpeg sustaining 2x+ speed for 100+ seconds rather than
-        # briefly catching up and settling near 1x), ffmpeg processes and
-        # emits output in bursts rather than smooth real-time flow, which
-        # downstream clients perceive as jittery/choppy playback.
-        ffmpeg_cmd.extend(["-re", "-i", stream_url])
+        # NOTE: -re was previously used here to pace input reading at 1x
+        # real-time rate. It was removed because with a live transcoding
+        # upstream (Masqueradarr in remux/copy mode), -re throttles how fast
+        # ffmpeg consumes data from the HTTP connection. When ffmpeg connects
+        # mid-GOP and the decoder is stuck on undecodeable P/B frames (no
+        # SPS/PPS yet), -re causes ffmpeg to consume packets so slowly that
+        # Masqueradarr's output buffer fills up and stops sending — producing
+        # a permanent stall before the first IDR frame ever arrives.
+        # Without -re, ffmpeg reads as fast as the network allows, burns
+        # through the initial mid-GOP junk quickly, and reaches the next IDR
+        # frame before any buffer backs up. Output rate is already controlled
+        # by -vsync cfr and -r 30 on the encode side, so removing -re does
+        # not cause burst/jitter issues on a live source that delivers at
+        # real-time rate. If a future source delivers significantly faster
+        # than real-time and causes burst issues, re-introduce -re only for
+        # that source via a separate ffmpeg profile.
+        ffmpeg_cmd.extend(["-i", stream_url])
     else:
         ffmpeg_cmd.extend(["-f", "lavfi", "-i", f"color=c=black:s=1280x720:r={OUTPUT_FPS}"])
-        ffmpeg_cmd.extend(["-re", "-i", stream_url])
+        ffmpeg_cmd.extend(["-i", stream_url])
 
     if not has_audio:
         ffmpeg_cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
