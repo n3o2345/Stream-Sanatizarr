@@ -11,7 +11,7 @@ logger = logging.getLogger("StreamSanitizarr")
 
 app = FastAPI(title="FAST Stream Sanitizer Proxy")
 
-VIDEO_CODEC = os.getenv("VIDEO_CODEC", "libx264")  
+VIDEO_CODEC = os.getenv("VIDEO_CODEC", "libx264")
 VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "3000k")
 AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 STREAM_USER_AGENT = os.getenv(
@@ -20,6 +20,183 @@ STREAM_USER_AGENT = os.getenv(
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
 )
 PROBE_TIMEOUT = float(os.getenv("PROBE_TIMEOUT", "10"))
+
+# Maximum seconds of silence on ffmpeg's stdout before we treat the worker
+# as stalled and force a respawn. This covers the case where the upstream
+# (e.g. a Pluto TV ad-break stitching gap, or Masqueradarr's internal
+# engine pausing) goes quiet WITHOUT actually closing the TCP connection.
+# In that case ffmpeg stays alive and "connected" indefinitely, so none of
+# the -reconnect* flags or the existing "if not chunk: break" disconnect
+# detection ever fire - the read() call just blocks waiting for data that
+# isn't coming. Left unhandled, this produces the freeze-then-burst-catchup
+# pattern (a long visible freeze, then a jerky dump of buffered frames once
+# the source resumes) instead of a clean, fast respawn.
+STALL_TIMEOUT = float(os.getenv("STALL_TIMEOUT", "8"))
+
+# How many recent chunks to keep in memory per channel so that a newly
+# connecting client (or Dispatcharr's buffer-fill phase) gets a small
+# burst of recent data immediately rather than waiting for the next chunk
+# from ffmpeg. 4 chunks at 65536 bytes each = ~256 KB, roughly 0.5-1s of
+# video at 2-3 Mbps — enough to satisfy Dispatcharr's buffer-threshold
+# check without holding too much in memory.
+SUBSCRIBER_QUEUE_DEPTH = int(os.getenv("SUBSCRIBER_QUEUE_DEPTH", "32"))
+
+
+# ---------------------------------------------------------------------------
+# Channel broker — one ffmpeg worker per unique source URL
+# ---------------------------------------------------------------------------
+#
+# Previously, every GET /stream request spawned its own independent ffmpeg
+# process pulling from the same upstream URL. Two simultaneous connections
+# (e.g. Dispatcharr reconnecting while the old connection is still alive)
+# would produce two ffmpeg workers both hitting Masqueradarr at once. That
+# upstream contention was itself the primary cause of stalls and H.264
+# decode errors after respawn (Masqueradarr's engine can't cleanly serve
+# two simultaneous reads of the same channel, so one or both get garbage
+# data). The broker ensures only ONE ffmpeg worker ever runs per URL, and
+# all clients subscribe to its output via per-client asyncio queues.
+
+class ChannelBroker:
+    def __init__(self):
+        # url -> {"task": asyncio.Task, "queues": set[asyncio.Queue], "lock": asyncio.Lock}
+        self._channels: dict[str, dict] = {}
+        self._global_lock = asyncio.Lock()
+
+    async def subscribe(self, url: str) -> asyncio.Queue:
+        """Return a queue that will receive chunks for this URL, starting the
+        worker task if one is not already running."""
+        async with self._global_lock:
+            if url not in self._channels:
+                self._channels[url] = {
+                    "task": None,
+                    "queues": set(),
+                    "lock": asyncio.Lock(),
+                }
+            ch = self._channels[url]
+
+        async with ch["lock"]:
+            q: asyncio.Queue = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_DEPTH)
+            ch["queues"].add(q)
+            if ch["task"] is None or ch["task"].done():
+                logger.info(f"[broker] Starting worker for {url} (clients: {len(ch['queues'])})")
+                ch["task"] = asyncio.create_task(self._worker(url))
+            else:
+                logger.info(f"[broker] Joining existing worker for {url} (clients: {len(ch['queues'])})")
+            return q
+
+    async def unsubscribe(self, url: str, q: asyncio.Queue):
+        """Remove a client queue. If no clients remain, cancel the worker."""
+        if url not in self._channels:
+            return
+        ch = self._channels[url]
+        async with ch["lock"]:
+            ch["queues"].discard(q)
+            remaining = len(ch["queues"])
+            logger.info(f"[broker] Client left {url} (remaining: {remaining})")
+            if remaining == 0:
+                if ch["task"] and not ch["task"].done():
+                    logger.info(f"[broker] No clients left for {url}, stopping worker.")
+                    ch["task"].cancel()
+                async with self._global_lock:
+                    self._channels.pop(url, None)
+
+    async def _broadcast(self, url: str, chunk: bytes):
+        """Push a chunk to every subscriber queue for this URL. If a queue is
+        full (slow client), drop the oldest chunk to make room rather than
+        blocking the worker for every other client."""
+        if url not in self._channels:
+            return
+        ch = self._channels[url]
+        for q in list(ch["queues"]):
+            if q.full():
+                try:
+                    q.get_nowait()  # drop oldest
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                q.put_nowait(chunk)
+            except asyncio.QueueFull:
+                pass  # already handled above; just skip if still full
+
+    async def _worker(self, url: str):
+        """Single ffmpeg worker for one source URL. Runs until cancelled
+        (all clients disconnected) or the outer task is explicitly cancelled."""
+        probe = await probe_stream(url)
+
+        while True:
+            ffmpeg_cmd = build_ffmpeg_cmd(url, probe)
+            logger.info(f"[broker] Spawning FFmpeg worker for stream: {url}")
+            process = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            async def _drain_stderr(proc):
+                try:
+                    async for line in proc.stderr:
+                        decoded = line.decode(errors="ignore").strip()
+                        if decoded:
+                            logger.warning(f"[ffmpeg] {decoded}")
+                except Exception:
+                    pass
+
+            stderr_task = asyncio.create_task(_drain_stderr(process))
+            stalled = False
+
+            try:
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            process.stdout.read(65536), timeout=STALL_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"[broker] No data from FFmpeg stdout for {STALL_TIMEOUT}s "
+                            f"(upstream stall, connection still open). Forcing respawn."
+                        )
+                        stalled = True
+                        break
+                    if not chunk:
+                        break
+                    await self._broadcast(url, chunk)
+            except asyncio.CancelledError:
+                logger.info(f"[broker] Worker cancelled for {url} (no clients remain).")
+                try:
+                    process.terminate()
+                    await process.wait()
+                except ProcessLookupError:
+                    pass
+                stderr_task.cancel()
+                raise
+            except Exception as e:
+                logger.error(f"[broker] Error reading stream chunks for {url}: {e}")
+            finally:
+                if process.returncode is None:
+                    try:
+                        process.terminate()
+                        await process.wait()
+                    except ProcessLookupError:
+                        pass
+                stderr_task.cancel()
+
+            if stalled:
+                logger.warning(f"[broker] Worker stalled (silent upstream) for {url}. Re-spawning...")
+            else:
+                logger.warning(f"[broker] Upstream disconnected for {url}. Re-spawning...")
+
+            # Some upstreams (e.g. masqueradarr's LocalNow handler) run their
+            # own internal capture engine (cvlc) that takes a few seconds to
+            # spin up and has its own idle-timeout/teardown logic. Retrying
+            # after only 1 second can land right in that engine's cold-start
+            # or teardown window, producing a flapping cycle of 502s/empty
+            # reads. A few seconds of breathing room avoids hammering a slow
+            # upstream mid-restart.
+            await asyncio.sleep(4)
+
+
+broker = ChannelBroker()
 
 
 async def probe_stream(stream_url: str) -> dict:
@@ -77,7 +254,7 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
 
     bufsize_str = f"{bitrate_int * 2}k"
     OUTPUT_FPS = 30
-    GOP_SIZE = OUTPUT_FPS * 2  
+    GOP_SIZE = OUTPUT_FPS * 2
 
     ffmpeg_cmd = [
         "ffmpeg",
@@ -85,8 +262,8 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         "-loglevel", "warning",
         "-progress", "pipe:2",
         "-stats_period", "5",
-        "-sn",                         # Strip subtitle streams from output mapping
-        "-dn",                         # Drop data stream tracks
+        "-sn",
+        "-dn",
         "-analyzeduration", "15000000",
         "-probesize", "15000000",
         "-user_agent", STREAM_USER_AGENT,
@@ -97,18 +274,15 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         "-fflags", "+genpts+discardcorrupt+igndts",
         "-avoid_negative_ts", "make_zero",
         # NOTE: -use_wallclock_as_timestamps was previously used here to
-        # survive A/V desync across a network stall/reconnect (since the
-        # worker respawn loop already handles full stalls/disconnects via
-        # ffmpeg_stream_generator's retry logic). It was removed because in
-        # steady-state operation it stamps every frame's PTS with its raw
-        # network arrival time, and live HTTP/TS proxy sources (especially
-        # one behind another transcode engine like Masqueradarr) rarely
-        # deliver packets at perfectly even intervals. That sub-frame
-        # jitter was enough to make -vsync cfr's frame dup/drop decisions
-        # uneven, producing visibly jerky motion even though average frame
-        # rate was correct. Relying on +genpts (synthesize timestamps from
-        # source DTS/duration) instead gives -vsync cfr a smoother, more
-        # evenly-spaced timestamp series to work from.
+        # survive A/V desync across a network stall/reconnect. It was removed
+        # because in steady-state operation it stamps every frame's PTS with
+        # its raw network arrival time. Live HTTP/TS proxy sources rarely
+        # deliver packets at perfectly even intervals, and that sub-frame
+        # jitter made -vsync cfr's dup/drop decisions uneven, producing
+        # visibly jerky motion even though average frame rate was correct.
+        # Relying on +genpts (synthesize timestamps from source DTS/duration)
+        # gives -vsync cfr a smoother timestamp series to work from. Full
+        # stalls/disconnects are handled by the broker's respawn loop.
     ]
 
     has_video = probe.get("has_video", True)
@@ -116,10 +290,6 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
 
     if VIDEO_CODEC == "h264_vaapi":
         ffmpeg_cmd.extend(["-vaapi_device", "/dev/dri/renderD128"])
-        # scale+pad (rather than a plain stretch-scale) preserves the
-        # source's aspect ratio and letterboxes/pillarboxes onto the fixed
-        # 1280x720 canvas instead of distorting non-16:9 sources (4:3,
-        # vertical, oddball aspect ratios some FAST sources serve).
         vf_filter = (
             f"scale=1280:720:force_original_aspect_ratio=decrease,"
             f"pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,"
@@ -135,11 +305,10 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
     if has_video:
         # -re paces reading of this input at its native/real-time rate.
         # Without it, if the upstream delivers data faster than real-time
-        # (observed here: ffmpeg sustaining 2x+ speed for 100+ seconds
-        # rather than briefly catching up and settling near 1x), ffmpeg
-        # processes and emits output in bursts rather than smooth
-        # real-time flow, which downstream clients perceive as jittery/
-        # choppy playback even though no actual errors are occurring.
+        # (observed: ffmpeg sustaining 2x+ speed for 100+ seconds rather than
+        # briefly catching up and settling near 1x), ffmpeg processes and
+        # emits output in bursts rather than smooth real-time flow, which
+        # downstream clients perceive as jittery/choppy playback.
         ffmpeg_cmd.extend(["-re", "-i", stream_url])
     else:
         ffmpeg_cmd.extend(["-f", "lavfi", "-i", f"color=c=black:s=1280x720:r={OUTPUT_FPS}"])
@@ -153,8 +322,8 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         real_source_idx = 0
         next_free_idx = 1
     else:
-        video_input_idx = 0       
-        real_source_idx = 1       
+        video_input_idx = 0
+        real_source_idx = 1
         next_free_idx = 2
 
     if has_audio:
@@ -189,9 +358,7 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         # separately-paced PIDs). Without enough queue depth, ffmpeg's
         # muxer backs up waiting to interleave the slower stream's packets,
         # producing escalating "buffers queued ... something may be wrong"
-        # warnings and an effective stall/no-output condition. Raising the
-        # allowed queue depth gives the muxer enough slack to absorb that
-        # jitter instead of stalling.
+        # warnings and an effective stall/no-output condition.
         "-max_muxing_queue_size", "9999",
         "-f", "mpegts",
         "pipe:1",
@@ -200,98 +367,24 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
     return ffmpeg_cmd
 
 
-# Maximum seconds of silence on ffmpeg's stdout before we treat the worker
-# as stalled and force a respawn. This covers the case where the upstream
-# (e.g. a Pluto TV ad-break stitching gap, or Masqueradarr's internal
-# engine pausing) goes quiet WITHOUT actually closing the TCP connection.
-# In that case ffmpeg stays alive and "connected" indefinitely, so none of
-# the -reconnect* flags or the existing "if not chunk: break" disconnect
-# detection ever fire - the read() call just blocks waiting for data that
-# isn't coming. Left unhandled, this produces the freeze-then-burst-catchup
-# pattern (a long visible freeze, then a jerky dump of buffered frames once
-# the source resumes) instead of a clean, fast respawn.
-STALL_TIMEOUT = float(os.getenv("STALL_TIMEOUT", "8"))
-
-
-async def ffmpeg_stream_generator(stream_url: str):
-    probe = await probe_stream(stream_url)
-
-    while True:
-        ffmpeg_cmd = build_ffmpeg_cmd(stream_url, probe)
-        logger.info(f"Spawning FFmpeg worker for stream: {stream_url}")
-        process = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        async def _drain_stderr(proc):
-            try:
-                async for line in proc.stderr:
-                    decoded = line.decode(errors="ignore").strip()
-                    if decoded:
-                        logger.warning(f"[ffmpeg] {decoded}")
-            except Exception:
-                pass
-
-        stderr_task = asyncio.create_task(_drain_stderr(process))
-        stalled = False
-
-        try:
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(
-                        process.stdout.read(65536), timeout=STALL_TIMEOUT
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"No data from FFmpeg stdout for {STALL_TIMEOUT}s "
-                        f"(upstream stall, connection still open). Forcing respawn."
-                    )
-                    stalled = True
-                    break
-                if not chunk:
-                    break
-                yield chunk
-        except asyncio.CancelledError:
-            logger.info("Client disconnected. Terminating FFmpeg process.")
-            try:
-                process.terminate()
-                await process.wait()
-            except ProcessLookupError:
-                pass
-            raise
-        except Exception as e:
-            logger.error(f"Error while reading stream chunks: {e}")
-        finally:
-            if process.returncode is None:
-                try:
-                    process.terminate()
-                    await process.wait()
-                except ProcessLookupError:
-                    pass
-            stderr_task.cancel()
-
-        if stalled:
-            logger.warning("Worker stalled (silent upstream). Re-spawning worker...")
-        else:
-            logger.warning("Upstream stream disconnected. Re-spawning worker...")
-        # Some upstreams (e.g. masqueradarr's LocalNow handler) run their own
-        # internal capture engine (cvlc) that takes a few seconds to spin up
-        # and has its own idle-timeout/teardown logic. Retrying after only
-        # 1 second can land right in that engine's cold-start or teardown
-        # window, producing a flapping cycle of 502s/empty reads that looks
-        # like "no audio/video" even though the sanitizer itself is healthy.
-        # A few seconds of breathing room avoids hammering a slow upstream
-        # mid-restart.
-        await asyncio.sleep(4)
+async def subscriber_generator(url: str, q: asyncio.Queue):
+    """Async generator that yields chunks from the broker queue for one client."""
+    try:
+        while True:
+            chunk = await q.get()
+            if chunk is None:
+                break
+            yield chunk
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await broker.unsubscribe(url, q)
 
 
 @app.get("/", response_class=HTMLResponse)
 async def web_ui(source: str = Query(None)):
     proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://192.168.1.254:8096").rstrip("/")
-    
+
     generated_url = ""
     if source:
         encoded_source = urllib.parse.quote(source.strip(), safe='')
@@ -340,10 +433,10 @@ async def web_ui(source: str = Query(None)):
 async def stream_proxy(request: Request):
     raw_query_bytes = request.scope.get("query_string", b"")
     raw_query = raw_query_bytes.decode("utf-8")
-    
+
     if not raw_query.startswith("url="):
         raise HTTPException(status_code=400, detail="Missing target URL token prefix.")
-    
+
     target_url = raw_query[4:]
     target_url = urllib.parse.unquote(target_url)
 
@@ -356,14 +449,19 @@ async def stream_proxy(request: Request):
         target_url = f"{path_part}{sep}{qs_part}"
 
     logger.info(f"Targeting sanitized stream destination: {target_url}")
-    return StreamingResponse(ffmpeg_stream_generator(target_url), media_type="video/mp2t")
+
+    q = await broker.subscribe(target_url)
+    return StreamingResponse(
+        subscriber_generator(target_url, q),
+        media_type="video/mp2t",
+    )
 
 
 @app.get("/playlist")
 async def playlist_proxy(url: str):
     if not url:
         raise HTTPException(status_code=400, detail="Missing required 'url' parameter.")
-    
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.get(url)
@@ -375,7 +473,7 @@ async def playlist_proxy(url: str):
 
     proxy_host = os.getenv("PROXY_PUBLIC_URL", "http://192.168.1.254:8096").rstrip("/")
     sanitized_lines = []
-    
+
     for line in raw_m3u.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
@@ -406,7 +504,7 @@ async def playlist_proxy(url: str):
             sanitized_lines.append(sanitized_line)
         else:
             sanitized_lines.append(line)
-            
+
     return Response(content="\n".join(sanitized_lines), media_type="application/x-mpegurl")
 
 
