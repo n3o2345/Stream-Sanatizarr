@@ -19,7 +19,6 @@ STREAM_USER_AGENT = os.getenv(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
 )
-PROBE_TIMEOUT = float(os.getenv("PROBE_TIMEOUT", "10"))
 
 # Maximum seconds of silence on ffmpeg's stdout before we treat the worker
 # as stalled and force a respawn. This covers the case where the upstream
@@ -121,7 +120,14 @@ class ChannelBroker:
     async def _worker(self, url: str):
         """Single ffmpeg worker for one source URL. Runs until cancelled
         (all clients disconnected) or the outer task is explicitly cancelled."""
-        probe = await probe_stream(url)
+        # NOTE: there is deliberately NO ffprobe/preflight pass on `url`
+        # before ffmpeg connects. Masqueradarr's FAST channel adapters
+        # (Pluto, LocalNow) hand out single-use tokenized URLs - a
+        # preflight probe consumes the token, so by the time ffmpeg
+        # itself connects, the URL is already dead/expired. ffmpeg makes
+        # the ONE and ONLY connection to `url`; missing audio is handled
+        # via the optional "?" stream mapping in build_ffmpeg_cmd()
+        # instead of pre-detecting stream layout.
 
         # Track how many consecutive attempts produced zero output bytes.
         # When Masqueradarr's upstream CDN source is dead or the CDN feed
@@ -140,7 +146,7 @@ class ChannelBroker:
         MAX_BACKOFF = 60  # seconds
 
         while True:
-            ffmpeg_cmd = build_ffmpeg_cmd(url, probe)
+            ffmpeg_cmd = build_ffmpeg_cmd(url)
             logger.info(f"[broker] Spawning FFmpeg worker for stream: {url}")
             process = await asyncio.create_subprocess_exec(
                 *ffmpeg_cmd,
@@ -250,53 +256,7 @@ class ChannelBroker:
 broker = ChannelBroker()
 
 
-async def probe_stream(stream_url: str) -> dict:
-    """Probe the source with ffprobe to find out what's actually in it."""
-    info = {"has_video": True, "has_audio": True}
-
-    ffprobe_cmd = [
-        "ffprobe",
-        "-loglevel", "error",
-        "-user_agent", STREAM_USER_AGENT,
-        "-print_format", "json",
-        "-show_streams",
-        stream_url,
-    ]
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *ffprobe_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=PROBE_TIMEOUT)
-
-        if proc.returncode != 0:
-            logger.warning(f"ffprobe exited {proc.returncode}: {stderr.decode(errors='ignore').strip()}")
-            return info
-
-        import json
-        data = json.loads(stdout.decode(errors="ignore") or "{}")
-        streams = data.get("streams", [])
-
-        video_streams = [s for s in streams if s.get("codec_type") == "video"]
-        audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
-
-        info["has_video"] = bool(video_streams)
-        info["has_audio"] = bool(audio_streams)
-
-        logger.info(
-            f"Probe result for {stream_url}: video={info['has_video']} audio={info['has_audio']}"
-        )
-    except asyncio.TimeoutError:
-        logger.warning(f"ffprobe timed out after {PROBE_TIMEOUT}s, assuming standard layout.")
-    except Exception as e:
-        logger.warning(f"ffprobe failed ({e}), assuming standard layout.")
-
-    return info
-
-
-def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
+def build_ffmpeg_cmd(stream_url: str) -> list:
     try:
         clean_bitrate = "".join(c for c in VIDEO_BITRATE if c.isdigit())
         bitrate_int = int(clean_bitrate) if clean_bitrate else 3000
@@ -336,9 +296,6 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         # stalls/disconnects are handled by the broker's respawn loop.
     ]
 
-    has_video = probe.get("has_video", True)
-    has_audio = probe.get("has_audio", True)
-
     if VIDEO_CODEC == "h264_vaapi":
         ffmpeg_cmd.extend(["-vaapi_device", "/dev/dri/renderD128"])
         vf_filter = (
@@ -353,47 +310,38 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
             f"fps={OUTPUT_FPS},format=yuv420p"
         )
 
-    if has_video:
-        # NOTE: -re was previously used here to pace input reading at 1x
-        # real-time rate. It was removed because with a live transcoding
-        # upstream (Masqueradarr in remux/copy mode), -re throttles how fast
-        # ffmpeg consumes data from the HTTP connection. When ffmpeg connects
-        # mid-GOP and the decoder is stuck on undecodeable P/B frames (no
-        # SPS/PPS yet), -re causes ffmpeg to consume packets so slowly that
-        # Masqueradarr's output buffer fills up and stops sending — producing
-        # a permanent stall before the first IDR frame ever arrives.
-        # Without -re, ffmpeg reads as fast as the network allows, burns
-        # through the initial mid-GOP junk quickly, and reaches the next IDR
-        # frame before any buffer backs up. Output rate is already controlled
-        # by -vsync cfr and -r 30 on the encode side, so removing -re does
-        # not cause burst/jitter issues on a live source that delivers at
-        # real-time rate. If a future source delivers significantly faster
-        # than real-time and causes burst issues, re-introduce -re only for
-        # that source via a separate ffmpeg profile.
-        ffmpeg_cmd.extend(["-i", stream_url])
-    else:
-        ffmpeg_cmd.extend(["-f", "lavfi", "-i", f"color=c=black:s=1280x720:r={OUTPUT_FPS}"])
-        ffmpeg_cmd.extend(["-i", stream_url])
+    # NOTE: -re was previously used here to pace input reading at 1x
+    # real-time rate. It was removed because with a live transcoding
+    # upstream (Masqueradarr in remux/copy mode), -re throttles how fast
+    # ffmpeg consumes data from the HTTP connection. When ffmpeg connects
+    # mid-GOP and the decoder is stuck on undecodeable P/B frames (no
+    # SPS/PPS yet), -re causes ffmpeg to consume packets so slowly that
+    # Masqueradarr's output buffer fills up and stops sending — producing
+    # a permanent stall before the first IDR frame ever arrives.
+    # Without -re, ffmpeg reads as fast as the network allows, burns
+    # through the initial mid-GOP junk quickly, and reaches the next IDR
+    # frame before any buffer backs up. Output rate is already controlled
+    # by -vsync cfr and -r 30 on the encode side, so removing -re does
+    # not cause burst/jitter issues on a live source that delivers at
+    # real-time rate. If a future source delivers significantly faster
+    # than real-time and causes burst issues, re-introduce -re only for
+    # that source via a separate ffmpeg profile.
+    #
+    # There is a single input — `stream_url` — and nothing else. No
+    # preflight ffprobe, no second lavfi input keyed off probe results:
+    # Masqueradarr's FAST adapters (Pluto, LocalNow) issue single-use
+    # tokenized URLs, so the only connection this process is allowed to
+    # make to `url` is the one ffmpeg itself opens here. Whether the
+    # source actually carries an audio stream is discovered by ffmpeg at
+    # connect time, not predicted beforehand.
+    ffmpeg_cmd.extend(["-i", stream_url])
 
-    if not has_audio:
-        ffmpeg_cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
-
-    if has_video:
-        video_input_idx = 0
-        real_source_idx = 0
-        next_free_idx = 1
-    else:
-        video_input_idx = 0
-        real_source_idx = 1
-        next_free_idx = 2
-
-    if has_audio:
-        audio_map = f"{real_source_idx}:a:0?"
-    else:
-        audio_map = f"{next_free_idx}:a:0"
-
-    ffmpeg_cmd.extend(["-map", f"{video_input_idx}:v:0"])
-    ffmpeg_cmd.extend(["-map", audio_map])
+    # "0:a:0?" — the trailing "?" makes the audio map optional, so an
+    # audio-less source (or one whose audio track hasn't appeared yet
+    # within the analyze window) doesn't abort the whole ffmpeg process.
+    # This is what replaced the old ffprobe-then-branch approach.
+    ffmpeg_cmd.extend(["-map", "0:v:0"])
+    ffmpeg_cmd.extend(["-map", "0:a:0?"])
 
     ffmpeg_cmd.extend([
         "-c:v", VIDEO_CODEC,
