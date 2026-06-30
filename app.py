@@ -31,21 +31,29 @@ STREAM_USER_AGENT = os.getenv(
 # isn't coming. Left unhandled, this produces the freeze-then-burst-catchup
 # pattern (a long visible freeze, then a jerky dump of buffered frames once
 # the source resumes) instead of a clean, fast respawn.
-STALL_TIMEOUT = float(os.getenv("STALL_TIMEOUT", "15"))
+STALL_TIMEOUT = float(os.getenv("STALL_TIMEOUT", "45"))
 
 # IMPORTANT - this value is not arbitrary, raise it carefully if at all.
-# Observed live evidence (LocalNow/alf, 2026-06-30): the upstream went
-# silent for ~9s with the TCP connection still open (a normal ad-stitcher
-# pause, not a dead source). The old 5s timeout killed that healthy
-# process anyway. The respawn then had to wait ~15s for the next real
-# keyframe before producing any output (connecting mid-GOP always means
-# decoding garbage until the next IDR - see build_ffmpeg_cmd notes).
-# Net result: a 9s natural pause became a ~24s visible freeze, because
-# killing a still-connected process throws away its decoder context and
-# forces a fresh mid-GOP resync on top of the original gap. Waiting out
-# the pause costs nothing extra; respawning into it costs ~15s. So
-# STALL_TIMEOUT needs to comfortably exceed this source's normal pause
-# length, or every transient stitcher gap gets needlessly amplified.
+# Observed live evidence on this same LocalNow channel (alf):
+#   - 2026-06-30 23:26: ~9s silent gap, connection stayed open the whole
+#     time. The then-5s timeout killed a healthy process; the respawn's
+#     mid-GOP resync added ~15s on top, turning a 9s pause into a ~24s
+#     freeze.
+#   - 2026-06-30 23:49: a SECOND gap exceeded the increased 15s timeout
+#     and triggered another unnecessary respawn+resync, confirmed by the
+#     user as happening specifically AT A COMMERCIAL BREAK.
+# Conclusion: this channel's ad-pod stitching (content <-> commercial
+# transitions) holds the connection open but silent for well over 15s.
+# Since "connection still open" means ffmpeg would resume immediately
+# with ZERO resync penalty if we just let it keep waiting, and a forced
+# respawn ALWAYS costs an extra mid-GOP keyframe wait on top of whatever
+# the gap actually is, waiting is strictly cheaper than respawning for
+# this failure mode. STALL_TIMEOUT is set well above the longest observed
+# commercial-transition gap so normal ad breaks no longer trigger a
+# respawn at all. It still exists as a safety net for a TRULY stuck
+# connection (one that never closes and never resumes) - genuine
+# disconnects (chunk == b"") are detected separately and respawn
+# immediately regardless of this value.
 
 # Separate, longer watchdog for time-to-FIRST-byte. ffmpeg is configured
 # with -analyzeduration/-probesize 15000000 (15s) below, and Masqueradarr's
