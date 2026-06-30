@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 import urllib.parse
 import httpx
 from fastapi import FastAPI, HTTPException, Response, Query, Request
@@ -155,8 +156,21 @@ class ChannelBroker:
         zero_output_streak = 0
         MAX_BACKOFF = 60  # seconds
 
+        # Wall-clock anchor for this channel session (persists across
+        # respawns within the same _worker call). Used to compute
+        # -output_ts_offset below so that a fresh ffmpeg process continues
+        # the PTS series roughly where the last one left off, instead of
+        # restarting near 0. Without this, every respawn splices a stream
+        # with backward-jumping timestamps into the SAME ongoing HTTP
+        # response Dispatcharr is already reading - most players treat a
+        # large negative PTS jump as a frozen/stuck buffer rather than
+        # resyncing, which is what produces "plays fine, then freezes
+        # forever" instead of a brief, recoverable glitch.
+        session_start = time.monotonic()
+
         while True:
-            ffmpeg_cmd = build_ffmpeg_cmd(url)
+            ts_offset = time.monotonic() - session_start
+            ffmpeg_cmd = build_ffmpeg_cmd(url, ts_offset)
             logger.info(f"[broker] Spawning FFmpeg worker for stream: {url}")
             process = await asyncio.create_subprocess_exec(
                 *ffmpeg_cmd,
@@ -290,7 +304,7 @@ class ChannelBroker:
 broker = ChannelBroker()
 
 
-def build_ffmpeg_cmd(stream_url: str) -> list:
+def build_ffmpeg_cmd(stream_url: str, ts_offset: float = 0.0) -> list:
     try:
         clean_bitrate = "".join(c for c in VIDEO_BITRATE if c.isdigit())
         bitrate_int = int(clean_bitrate) if clean_bitrate else 3000
@@ -396,6 +410,13 @@ def build_ffmpeg_cmd(stream_url: str) -> list:
         "-mpegts_flags", "+resend_headers",
         "-muxdelay", "0",
         "-muxpreload", "0",
+        # Anchors this process's output timestamps to where the PREVIOUS
+        # ffmpeg process (for this same channel session) left off, instead
+        # of starting back near 0. Every respawn is spliced into the same
+        # ongoing HTTP response Dispatcharr is already reading; without
+        # this, that splice point is a large backward PTS jump, which is
+        # what turns a brief stall into a permanent on-screen freeze.
+        "-output_ts_offset", f"{max(ts_offset, 0.0):.3f}",
         # Some live sources deliver audio/video packets at uneven, jittery
         # rates relative to each other (common on HTTP/TS sources with
         # separately-paced PIDs). Without enough queue depth, ffmpeg's
