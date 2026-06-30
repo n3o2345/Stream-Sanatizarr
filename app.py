@@ -209,7 +209,15 @@ async def ffmpeg_stream_generator(stream_url: str):
             stderr_task.cancel()
         
         logger.warning("Upstream stream disconnected. Re-spawning worker...")
-        await asyncio.sleep(1)
+        # Some upstreams (e.g. masqueradarr's LocalNow handler) run their own
+        # internal capture engine (cvlc) that takes a few seconds to spin up
+        # and has its own idle-timeout/teardown logic. Retrying after only
+        # 1 second can land right in that engine's cold-start or teardown
+        # window, producing a flapping cycle of 502s/empty reads that looks
+        # like "no audio/video" even though the sanitizer itself is healthy.
+        # A few seconds of breathing room avoids hammering a slow upstream
+        # mid-restart.
+        await asyncio.sleep(4)
 
 
 @app.get("/", response_class=HTMLResponse)
