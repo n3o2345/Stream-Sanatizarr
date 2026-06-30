@@ -96,6 +96,14 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         "-reconnect_delay_max", "5",
         "-fflags", "+genpts+discardcorrupt+igndts",
         "-avoid_negative_ts", "make_zero",
+        # Base input timestamps on actual wall-clock receipt time rather
+        # than trusting the source's embedded PTS. Live HTTP/TS sources can
+        # have unreliable timestamps across a real network stall/reconnect;
+        # without this, video (-vsync cfr) and audio (aresample async) can
+        # each independently drift relative to real elapsed time during a
+        # stall and never realign once data resumes, producing a permanent
+        # A/V desync for the rest of that worker's session.
+        "-use_wallclock_as_timestamps", "1",
     ]
 
     has_video = probe.get("has_video", True)
