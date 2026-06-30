@@ -83,6 +83,8 @@ def build_ffmpeg_cmd(stream_url: str, probe: dict) -> list:
         "ffmpeg",
         "-nostdin",
         "-loglevel", "warning",
+        "-progress", "pipe:2",
+        "-stats_period", "5",
         "-sn",                         # Strip subtitle streams from output mapping
         "-dn",                         # Drop data stream tracks
         "-analyzeduration", "15000000",
