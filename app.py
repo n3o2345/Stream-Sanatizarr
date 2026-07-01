@@ -117,6 +117,22 @@ SUBSCRIBER_QUEUE_DEPTH = int(os.getenv("SUBSCRIBER_QUEUE_DEPTH", "32"))
 ABSURD_DTS_JUMP_SECONDS = float(os.getenv("ABSURD_DTS_JUMP_SECONDS", "300"))
 MPEGTS_CLOCK_HZ = 90000  # mpegts PTS/DTS are always 90kHz ticks
 
+# Actual observed ffmpeg wording (confirmed against live logs 2026-06-30/07-01):
+#   "[mpegts @ 0x...] DTS discontinuity in stream 0: packet 165 with DTS
+#    50661000, packet 166 with DTS 8590150592"
+#   "[out_0_0 @ 0x...] 1000000 buffers queued in out_0_0, something may be
+#    wrong."
+# An earlier version of this matched a "Non-monotonous DTS ... previous: X,
+# current: Y" phrasing and a "Too many packets buffered for output stream"
+# phrasing - neither of which ffmpeg actually emits for this failure mode,
+# so it silently never fired. Kept both old patterns below as a harmless
+# fallback in case a different ffmpeg build/version phrases it that way,
+# but the two patterns above are the ones actually confirmed to appear.
+_DTS_DISCONTINUITY_RE = re.compile(
+    r"dts discontinuity in stream\s+\d+:\s*packet\s+\d+\s+with\s+dts\s+(-?\d+),"
+    r"\s*packet\s+\d+\s+with\s+dts\s+(-?\d+)"
+)
+_BUFFERS_QUEUED_RE = re.compile(r"(\d+)\s+buffers queued in")
 _NON_MONOTONOUS_DTS_RE = re.compile(r"previous:\s*(-?\d+),\s*current:\s*(-?\d+)")
 
 
@@ -125,21 +141,41 @@ def _detect_absurd_dts_jump(line: str) -> str | None:
     +genpts+igndts cannot repair. Returns a short human-readable reason if
     this line means the worker should respawn immediately, else None.
 
-    Two independent triggers:
-      1. The mpegts muxer's own "Non-monotonous DTS ... previous: X,
-         current: Y" warning, when |X - Y| (in 90kHz mpegts ticks) exceeds
-         ABSURD_DTS_JUMP_SECONDS. A small reorder is routine and the muxer
-         clamps it fine unassisted; only a genuinely absurd jump is worth
-         killing the process over.
-      2. "Too many packets buffered for output stream" - the mux queue is
-         actively filling because the muxer can't reconcile a jumped
-         stream against the other stream's normal timestamps. This fires
-         regardless of magnitude since it's the memory-growth symptom
-         itself, already in progress.
+    Triggers, in order of how they've actually been observed to fire:
+      1. "N buffers queued in ..., something may be wrong" - the muxer's
+         interleave queue is actively exploding (observed going
+         100 -> 1,000 -> 10,000 -> 100,000 -> 1,000,000 in ~1.3s on a real
+         DTS-discontinuity event). This IS the memory-eating symptom
+         itself, already in progress, so ANY occurrence triggers - there
+         is no safe magnitude to wait past once the muxer is logging this
+         at all, since normal operation never logs it.
+      2. "DTS discontinuity in stream N: packet A with DTS X, packet B
+         with DTS Y" - ffmpeg's actual discontinuity warning. Triggers
+         when |X - Y| (90kHz ticks) exceeds ABSURD_DTS_JUMP_SECONDS. A
+         real reorder is a handful of ticks; this is for jumps of hours.
+      3/4. "Non-monotonous DTS ... previous: X, current: Y" and "Too many
+         packets buffered for output stream" - not confirmed to appear
+         for this source/ffmpeg build, kept as a fallback only.
     """
     lowered = line.lower()
+
+    if _BUFFERS_QUEUED_RE.search(lowered):
+        return "muxer interleave queue exploding (buffers queued warning)"
+
     if "too many packets buffered for output stream" in lowered:
         return "mux queue filling (memory growth risk)"
+
+    match = _DTS_DISCONTINUITY_RE.search(lowered)
+    if match:
+        previous_ts, current_ts = int(match.group(1)), int(match.group(2))
+        jump_seconds = abs(current_ts - previous_ts) / MPEGTS_CLOCK_HZ
+        if jump_seconds >= ABSURD_DTS_JUMP_SECONDS:
+            return (
+                f"absurd DTS discontinuity ({jump_seconds:.0f}s, "
+                f"exceeds {ABSURD_DTS_JUMP_SECONDS:.0f}s threshold)"
+            )
+        return None
+
     if "non-monotonous dts" in lowered:
         match = _NON_MONOTONOUS_DTS_RE.search(line)
         if match:
