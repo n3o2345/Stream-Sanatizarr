@@ -65,6 +65,18 @@ STALL_TIMEOUT = float(os.getenv("STALL_TIMEOUT", "45"))
 # Masqueradarr's own startup latency.
 STARTUP_TIMEOUT = float(os.getenv("STARTUP_TIMEOUT", "20"))
 
+# How long the primary feed can go silent before the broker starts
+# broadcasting the filler (black+silence) stream instead of leaving the
+# client's byte pipe hanging. Deliberately SHORT and independent of
+# STALL_TIMEOUT: STALL_TIMEOUT (45s) governs when we give up on the
+# CURRENT ffmpeg process and force a full respawn (expensive - mid-GOP
+# resync); GAP_FILLER_THRESHOLD governs when the client-visible output
+# stops being silent. The two are decoupled on purpose - the client should
+# never see a raw stall regardless of how long upstream recovery takes, so
+# this can stay short (a quick dip to black) while STALL_TIMEOUT stays
+# generous (avoids unnecessary respawns on legitimate long pauses).
+GAP_FILLER_THRESHOLD = float(os.getenv("GAP_FILLER_THRESHOLD", "1.5"))
+
 # How many recent chunks to keep in memory per channel so that a newly
 # connecting client (or Dispatcharr's buffer-fill phase) gets a small
 # burst of recent data immediately rather than waiting for the next chunk
@@ -103,6 +115,15 @@ class ChannelBroker:
                     "task": None,
                     "queues": set(),
                     "lock": asyncio.Lock(),
+                    # Filler (gap-cover) state - see GAP_FILLER_THRESHOLD /
+                    # _ensure_filler / _filler_worker below.
+                    "filler_task": None,
+                    "active_source": "primary",  # which producer's chunks currently reach clients
+                    "last_primary_at": time.monotonic(),
+                    # Shared wall-clock anchor for -output_ts_offset, used by
+                    # BOTH the primary worker and the filler worker so a
+                    # primary<->filler switch doesn't jump the timeline.
+                    "session_start": time.monotonic(),
                 }
             ch = self._channels[url]
 
@@ -129,16 +150,26 @@ class ChannelBroker:
                 if ch["task"] and not ch["task"].done():
                     logger.info(f"[broker] No clients left for {url}, stopping worker.")
                     ch["task"].cancel()
+                if ch.get("filler_task") and not ch["filler_task"].done():
+                    ch["filler_task"].cancel()
                 async with self._global_lock:
                     self._channels.pop(url, None)
 
-    async def _broadcast(self, url: str, chunk: bytes):
-        """Push a chunk to every subscriber queue for this URL. If a queue is
-        full (slow client), drop the oldest chunk to make room rather than
-        blocking the worker for every other client."""
+    async def _broadcast(self, url: str, chunk: bytes, source: str):
+        """Push a chunk to every subscriber queue for this URL - but ONLY if
+        `source` is the channel's currently-active producer ("primary" or
+        "filler"). This is what prevents primary and filler bytes from ever
+        being interleaved into the same MPEG-TS output (which would be
+        invalid/garbage on the wire) - exactly one producer's bytes reach
+        clients at any moment, and the switch between them is a clean
+        boundary, not a mix. If a queue is full (slow client), drop the
+        oldest chunk to make room rather than blocking the worker for every
+        other client."""
         if url not in self._channels:
             return
         ch = self._channels[url]
+        if ch.get("active_source") != source:
+            return
         for q in list(ch["queues"]):
             if q.full():
                 try:
@@ -149,6 +180,64 @@ class ChannelBroker:
                 q.put_nowait(chunk)
             except asyncio.QueueFull:
                 pass  # already handled above; just skip if still full
+
+    def _ensure_filler(self, url: str):
+        """Start the filler (black+silence) task for this channel if it
+        isn't already running. Called from the primary worker the instant
+        it detects a silence gap - NOT run continuously, so a healthy
+        channel costs nothing extra (no second encoder running) and only
+        pays the filler's startup cost during an actual gap. That startup
+        cost is small: color/anullsrc are generated locally with no
+        network round-trip or mid-GOP junk to burn through, so filler
+        output starts in well under a second."""
+        ch = self._channels.get(url)
+        if ch is None:
+            return
+        if ch.get("filler_task") is None or ch["filler_task"].done():
+            logger.info(f"[broker] Starting filler (black+silence) for {url}")
+            ch["filler_task"] = asyncio.create_task(self._filler_worker(url))
+
+    async def _filler_worker(self, url: str):
+        """Generate black+silence MPEG-TS until the primary feed resumes
+        (ch["active_source"] flips back to "primary") or the channel is
+        torn down (all clients left). Stops itself as soon as either
+        happens - it does not wait to be cancelled - so it doesn't keep
+        burning an encoder slot once the real feed is healthy again."""
+        ch = self._channels.get(url)
+        if ch is None:
+            return
+        ts_offset = time.monotonic() - ch["session_start"]
+        ffmpeg_cmd = build_filler_ffmpeg_cmd(ts_offset)
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            while True:
+                ch = self._channels.get(url)
+                if ch is None:
+                    break  # last client left; channel torn down
+                if ch.get("active_source") != "filler":
+                    break  # primary resumed - the primary worker already flipped active_source back
+                try:
+                    chunk = await asyncio.wait_for(process.stdout.read(65536), timeout=5.0)
+                except asyncio.TimeoutError:
+                    continue  # just re-check the conditions above and keep waiting
+                if not chunk:
+                    break
+                await self._broadcast(url, chunk, source="filler")
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                    await process.wait()
+                except ProcessLookupError:
+                    pass
+            logger.info(f"[broker] Filler stopped for {url}")
 
     async def _worker(self, url: str):
         """Single ffmpeg worker for one source URL. Runs until cancelled
@@ -178,8 +267,11 @@ class ChannelBroker:
         zero_output_streak = 0
         MAX_BACKOFF = 60  # seconds
 
-        # Wall-clock anchor for this channel session (persists across
-        # respawns within the same _worker call). Used to compute
+        # Wall-clock anchor for this channel session, shared with the
+        # filler worker (see subscribe()'s "session_start" channel-dict
+        # key) so both producers' -output_ts_offset stay on the same
+        # timeline - a primary<->filler switch shouldn't jump the clock
+        # any more than a primary respawn should. Used to compute
         # -output_ts_offset below so that a fresh ffmpeg process continues
         # the PTS series roughly where the last one left off, instead of
         # restarting near 0. Without this, every respawn splices a stream
@@ -188,7 +280,8 @@ class ChannelBroker:
         # large negative PTS jump as a frozen/stuck buffer rather than
         # resyncing, which is what produces "plays fine, then freezes
         # forever" instead of a brief, recoverable glitch.
-        session_start = time.monotonic()
+        ch = self._channels.get(url)
+        session_start = ch["session_start"] if ch else time.monotonic()
 
         while True:
             ts_offset = time.monotonic() - session_start
@@ -216,45 +309,78 @@ class ChannelBroker:
             got_first_byte = False
 
             try:
+                silence_started_at = None  # set on the first short-poll timeout since the last chunk
                 while True:
                     try:
-                        # Time-to-first-byte gets a much longer leash than
-                        # the steady-state stall watchdog. ffmpeg is given
-                        # -analyzeduration/-probesize 15000000 (15s) to
-                        # analyze the input before it can emit anything on
-                        # stdout, and Masqueradarr's LocalNow/Pluto stitcher
-                        # can itself take several seconds to start serving
-                        # a freshly-spawned session. STALL_TIMEOUT (5s) is
-                        # tuned to catch a genuine mid-stream freeze on an
-                        # already-flowing connection - applying it to the
-                        # initial connect+analyze phase kills ffmpeg before
-                        # it ever has a chance to produce its first packet,
-                        # which looks identical to a dead source (zero
-                        # bytes, no ffmpeg error, repeating every respawn).
-                        read_timeout = STALL_TIMEOUT if got_first_byte else STARTUP_TIMEOUT
+                        # Two different timeouts on the SAME read() call:
+                        #   - Before the first byte: STARTUP_TIMEOUT (20s),
+                        #     unchanged - ffmpeg's -analyzeduration/-probesize
+                        #     window plus Masqueradarr's own startup latency.
+                        #   - After the first byte: GAP_FILLER_THRESHOLD (short,
+                        #     ~1.5s), NOT STALL_TIMEOUT. This is what lets the
+                        #     loop react fast enough to start the filler well
+                        #     before the old 45s STALL_TIMEOUT would ever fire.
+                        #     A short-poll timeout here does NOT mean "give up" -
+                        #     asyncio.StreamReader.read() is safe to retry after
+                        #     a wait_for timeout; nothing already buffered by the
+                        #     OS/transport is lost, we just loop and check again.
+                        #     STALL_TIMEOUT is still enforced below by accumulating
+                        #     silence_started_at across iterations - it just no
+                        #     longer blocks the loop for its full duration in one
+                        #     shot, so filler can start long before it fires.
+                        read_timeout = GAP_FILLER_THRESHOLD if got_first_byte else STARTUP_TIMEOUT
                         chunk = await asyncio.wait_for(
                             process.stdout.read(65536), timeout=read_timeout
                         )
                     except asyncio.TimeoutError:
-                        if got_first_byte:
-                            logger.warning(
-                                f"[broker] No data from FFmpeg stdout for {STALL_TIMEOUT}s "
-                                f"(upstream stall, connection still open). Forcing respawn."
-                            )
-                        else:
+                        if not got_first_byte:
                             logger.warning(
                                 f"[broker] No initial data from FFmpeg within {STARTUP_TIMEOUT}s "
                                 f"(startup/analyze phase never produced output). Forcing respawn."
                             )
-                        stalled = True
-                        break
+                            stalled = True
+                            break
+                        now = time.monotonic()
+                        if silence_started_at is None:
+                            silence_started_at = now
+                        silence_elapsed = now - silence_started_at
+                        # Short-poll timeout during steady state: no data in
+                        # the last GAP_FILLER_THRESHOLD window. Start covering
+                        # the gap with filler immediately (idempotent - a
+                        # no-op if filler is already running) rather than
+                        # waiting for the full STALL_TIMEOUT to decide the
+                        # feed is dead. This ffmpeg process is NOT killed
+                        # here; it keeps waiting on the same connection.
+                        ch = self._channels.get(url)
+                        if ch is not None and ch.get("active_source") != "filler":
+                            logger.info(
+                                f"[broker] No primary data for {silence_elapsed:.1f}s on {url}; "
+                                f"switching to filler."
+                            )
+                            ch["active_source"] = "filler"
+                            self._ensure_filler(url)
+                        if silence_elapsed >= STALL_TIMEOUT:
+                            logger.warning(
+                                f"[broker] No data from FFmpeg stdout for {STALL_TIMEOUT}s "
+                                f"(upstream stall, connection still open). Forcing respawn."
+                            )
+                            stalled = True
+                            break
+                        continue  # keep short-polling; do NOT respawn yet
                     if not chunk:
                         break
+                    silence_started_at = None
                     if not got_first_byte:
                         got_first_byte = True
                         logger.info(f"[broker] First output bytes received for {url}")
                     bytes_produced += len(chunk)
-                    await self._broadcast(url, chunk)
+                    ch = self._channels.get(url)
+                    if ch is not None:
+                        ch["last_primary_at"] = time.monotonic()
+                        if ch.get("active_source") != "primary":
+                            logger.info(f"[broker] Primary feed resumed for {url}; switching off filler.")
+                            ch["active_source"] = "primary"
+                    await self._broadcast(url, chunk, source="primary")
             except asyncio.CancelledError:
                 logger.info(f"[broker] Worker cancelled for {url} (no clients remain).")
                 try:
@@ -465,6 +591,85 @@ def build_ffmpeg_cmd(stream_url: str, ts_offset: float = 0.0) -> list:
         # muxer backs up waiting to interleave the slower stream's packets,
         # producing escalating "buffers queued ... something may be wrong"
         # warnings and an effective stall/no-output condition.
+        "-max_muxing_queue_size", "9999",
+        "-f", "mpegts",
+        "pipe:1",
+    ])
+
+    return ffmpeg_cmd
+
+
+def build_filler_ffmpeg_cmd(ts_offset: float = 0.0) -> list:
+    """A locally-generated black+silence MPEG-TS stream, used to cover any
+    gap where the real upstream feed goes quiet. Deliberately mirrors
+    build_ffmpeg_cmd()'s video/audio codec, resolution, framerate, pixel
+    format, and audio layout EXACTLY. That parity is the entire point: the
+    broker splices filler bytes into the middle of the same continuous
+    MPEG-TS pipe the real feed writes to (and back again once real data
+    resumes). If the codec/profile/resolution differed even slightly,
+    Dispatcharr's downstream decoder would still have to reinitialize on
+    every switch - defeating the purpose of having a filler at all. Only
+    -output_ts_offset differs per-call, anchored to the SAME channel
+    session wall clock the real feed uses (see ChannelBroker), so a
+    primary<->filler switch doesn't introduce a timestamp jump either.
+
+    -re paces the lavfi source at real-time rate. Unlike the real feed
+    (where -re was deliberately removed - see build_ffmpeg_cmd's note on
+    mid-GOP stalls), that concern doesn't apply here: color/anullsrc are
+    generated locally with no network round-trip and no mid-GOP junk to
+    burn through, so -re just keeps this process from needlessly
+    generating (and buffering) frames faster than they'll be consumed.
+    """
+    try:
+        clean_bitrate = "".join(c for c in VIDEO_BITRATE if c.isdigit())
+        bitrate_int = int(clean_bitrate) if clean_bitrate else 3000
+    except Exception:
+        bitrate_int = 3000
+
+    bufsize_str = f"{bitrate_int * 2}k"
+    OUTPUT_FPS = 30
+    GOP_SIZE = OUTPUT_FPS * 2
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-loglevel", "warning",
+        "-re",
+        "-f", "lavfi",
+        "-i", f"color=c=black:s=1280x720:r={OUTPUT_FPS}",
+        "-f", "lavfi",
+        "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+    ]
+
+    if VIDEO_CODEC == "h264_vaapi":
+        ffmpeg_cmd.extend(["-vaapi_device", "/dev/dri/renderD128"])
+        vf_filter = "format=nv12,hwupload"
+    else:
+        vf_filter = "format=yuv420p"
+
+    ffmpeg_cmd.extend([
+        "-vf", vf_filter,
+        "-c:v", VIDEO_CODEC,
+        "-vsync", "cfr",
+        "-r", str(OUTPUT_FPS),
+        "-g", str(GOP_SIZE),
+        "-keyint_min", str(GOP_SIZE),
+        "-sc_threshold", "0",
+        "-b:v", VIDEO_BITRATE,
+        "-maxrate:v", VIDEO_BITRATE,
+        "-bufsize:v", bufsize_str,
+        "-c:a", "aac",
+        "-ac", "2",
+        "-ar", "48000",
+        "-b:a", AUDIO_BITRATE,
+        "-mpegts_flags", "+resend_headers",
+        "-muxdelay", "0",
+        "-muxpreload", "0",
+        # Anchored to the SAME channel session_start the real feed uses, so
+        # switching primary<->filler doesn't jump the output timeline.
+        "-output_ts_offset", f"{max(ts_offset, 0.0):.3f}",
         "-max_muxing_queue_size", "9999",
         "-f", "mpegts",
         "pipe:1",
