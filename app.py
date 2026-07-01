@@ -349,9 +349,29 @@ def build_ffmpeg_cmd(stream_url: str, ts_offset: float = 0.0) -> list:
         "-probesize", "15000000",
         "-user_agent", STREAM_USER_AGENT,
         "-reconnect", "1",
-        "-reconnect_at_eof", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "5",
+        # NOTE: -reconnect_at_eof is DELIBERATELY omitted. It was previously
+        # set to 1, and applies globally to every HTTP fetch ffmpeg makes -
+        # not just the primary input. For a Pluto HLS source, the HLS
+        # demuxer opens the master playlist AND every rendition listed in
+        # it (audio, video, and subtitle renditions), each over its own
+        # nested HTTP connection using the SAME reconnect settings passed
+        # at the top level. When a subtitle rendition is malformed/
+        # unsupported (see "Can't support the subtitle" warning) its child
+        # playlist fetch legitimately ends (EOF) - that's not a failure,
+        # it's a normal completed HTTP response. But -reconnect_at_eof
+        # treats ANY eof as "stream paused, try again", so ffmpeg reopens
+        # that same doomed subtitle URL immediately (0s delay) forever,
+        # in a tight loop that starves the demuxer's ability to ever read
+        # the actual video/audio segments. This produced a total stall:
+        # zero output bytes, Dispatcharr's live_proxy timing out after 30s
+        # waiting for the first buffer ("stalled in connecting state").
+        # -reconnect and -reconnect_streamed (kept) already cover the
+        # cases we actually need reconnect-on-drop behavior for on the
+        # main feed; -reconnect_at_eof specifically is what turned a
+        # broken side-channel (subtitles, which we don't even use - see
+        # -sn below) into a stream-wide freeze.
         "-fflags", "+genpts+discardcorrupt+igndts",
         "-avoid_negative_ts", "make_zero",
         # NOTE: -use_wallclock_as_timestamps was previously used here to
