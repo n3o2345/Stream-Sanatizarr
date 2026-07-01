@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 import urllib.parse
 import httpx
@@ -84,6 +85,72 @@ GAP_FILLER_THRESHOLD = float(os.getenv("GAP_FILLER_THRESHOLD", "1.5"))
 # video at 2-3 Mbps — enough to satisfy Dispatcharr's buffer-threshold
 # check without holding too much in memory.
 SUBSCRIBER_QUEUE_DEPTH = int(os.getenv("SUBSCRIBER_QUEUE_DEPTH", "32"))
+
+
+# ---------------------------------------------------------------------------
+# Absurd DTS jump detection
+# ---------------------------------------------------------------------------
+#
+# +genpts+igndts (see build_ffmpeg_cmd) synthesizes timestamps FROM the
+# source's own DTS/duration and ignores out-of-order DTS on the demux side -
+# but it has nothing sane to derive from when the source hands ffmpeg a
+# genuinely absurd discontinuity (not reordering - an actual multi-second/
+# -minute/negative jump). genpts just carries that same broken value
+# downstream, and the mpegts muxer is left to deal with it: either it logs
+# "Non-monotonous DTS ... changing to X" and clamps it (harmless, a few
+# ticks of reorder is normal and NOT what this is for), or it can't
+# reconcile the jumped stream against the other stream's still-normal
+# timestamps and starts buffering that other stream's packets waiting to
+# interleave - exactly what -max_muxing_queue_size (9999) exists to bound,
+# and exactly what "Too many packets buffered for output stream" reports
+# once it's approaching that cap. That's the literal memory-eating case.
+#
+# Crucially, ffmpeg keeps producing (garbage-timestamped) output the whole
+# time this happens, so none of the existing silence/stall detection above
+# ever sees it - bytes are still arriving on schedule. This has to be
+# detected off stderr, independent of the stdout read loop, and race it so
+# a forced respawn doesn't wait for the next read-timeout poll. Filler
+# (GAP_FILLER_THRESHOLD) already covers the client-visible gap on its own
+# silence-based trigger, so there's nothing to gain from letting this
+# process keep fighting a timestamp series it can't fix - respawn is
+# strictly cheaper than riding it out.
+ABSURD_DTS_JUMP_SECONDS = float(os.getenv("ABSURD_DTS_JUMP_SECONDS", "300"))
+MPEGTS_CLOCK_HZ = 90000  # mpegts PTS/DTS are always 90kHz ticks
+
+_NON_MONOTONOUS_DTS_RE = re.compile(r"previous:\s*(-?\d+),\s*current:\s*(-?\d+)")
+
+
+def _detect_absurd_dts_jump(line: str) -> str | None:
+    """Inspect one line of ffmpeg stderr for a timestamp discontinuity that
+    +genpts+igndts cannot repair. Returns a short human-readable reason if
+    this line means the worker should respawn immediately, else None.
+
+    Two independent triggers:
+      1. The mpegts muxer's own "Non-monotonous DTS ... previous: X,
+         current: Y" warning, when |X - Y| (in 90kHz mpegts ticks) exceeds
+         ABSURD_DTS_JUMP_SECONDS. A small reorder is routine and the muxer
+         clamps it fine unassisted; only a genuinely absurd jump is worth
+         killing the process over.
+      2. "Too many packets buffered for output stream" - the mux queue is
+         actively filling because the muxer can't reconcile a jumped
+         stream against the other stream's normal timestamps. This fires
+         regardless of magnitude since it's the memory-growth symptom
+         itself, already in progress.
+    """
+    lowered = line.lower()
+    if "too many packets buffered for output stream" in lowered:
+        return "mux queue filling (memory growth risk)"
+    if "non-monotonous dts" in lowered:
+        match = _NON_MONOTONOUS_DTS_RE.search(line)
+        if match:
+            previous_ts, current_ts = int(match.group(1)), int(match.group(2))
+            jump_seconds = abs(current_ts - previous_ts) / MPEGTS_CLOCK_HZ
+            if jump_seconds >= ABSURD_DTS_JUMP_SECONDS:
+                return (
+                    f"absurd DTS jump ({jump_seconds:.0f}s, "
+                    f"exceeds {ABSURD_DTS_JUMP_SECONDS:.0f}s threshold)"
+                )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -294,45 +361,82 @@ class ChannelBroker:
                 stderr=asyncio.subprocess.PIPE,
             )
 
+            # Set from _drain_stderr the instant a line matches
+            # _detect_absurd_dts_jump(). Checked by racing it against the
+            # stdout read below (NOT just polled between reads) because a
+            # genuinely broken source keeps producing bytes on schedule
+            # throughout the discontinuity - the ordinary
+            # silence/TimeoutError path below never fires for this case at
+            # all, since it only detects the ABSENCE of data.
+            dts_jump_event = asyncio.Event()
+            dts_jump_reason = {"text": None}
+
             async def _drain_stderr(proc):
                 try:
                     async for line in proc.stderr:
                         decoded = line.decode(errors="ignore").strip()
                         if decoded:
                             logger.warning(f"[ffmpeg] {decoded}")
+                            reason = _detect_absurd_dts_jump(decoded)
+                            if reason and not dts_jump_event.is_set():
+                                dts_jump_reason["text"] = reason
+                                dts_jump_event.set()
                 except Exception:
                     pass
 
             stderr_task = asyncio.create_task(_drain_stderr(process))
             stalled = False
+            dts_jump_triggered = False
             bytes_produced = 0
             got_first_byte = False
 
             try:
                 silence_started_at = None  # set on the first short-poll timeout since the last chunk
                 while True:
-                    try:
-                        # Two different timeouts on the SAME read() call:
-                        #   - Before the first byte: STARTUP_TIMEOUT (20s),
-                        #     unchanged - ffmpeg's -analyzeduration/-probesize
-                        #     window plus Masqueradarr's own startup latency.
-                        #   - After the first byte: GAP_FILLER_THRESHOLD (short,
-                        #     ~1.5s), NOT STALL_TIMEOUT. This is what lets the
-                        #     loop react fast enough to start the filler well
-                        #     before the old 45s STALL_TIMEOUT would ever fire.
-                        #     A short-poll timeout here does NOT mean "give up" -
-                        #     asyncio.StreamReader.read() is safe to retry after
-                        #     a wait_for timeout; nothing already buffered by the
-                        #     OS/transport is lost, we just loop and check again.
-                        #     STALL_TIMEOUT is still enforced below by accumulating
-                        #     silence_started_at across iterations - it just no
-                        #     longer blocks the loop for its full duration in one
-                        #     shot, so filler can start long before it fires.
-                        read_timeout = GAP_FILLER_THRESHOLD if got_first_byte else STARTUP_TIMEOUT
-                        chunk = await asyncio.wait_for(
-                            process.stdout.read(65536), timeout=read_timeout
+                    # Two different timeouts on the SAME read() call:
+                    #   - Before the first byte: STARTUP_TIMEOUT (20s),
+                    #     unchanged - ffmpeg's -analyzeduration/-probesize
+                    #     window plus Masqueradarr's own startup latency.
+                    #   - After the first byte: GAP_FILLER_THRESHOLD (short,
+                    #     ~1.5s), NOT STALL_TIMEOUT. This is what lets the
+                    #     loop react fast enough to start the filler well
+                    #     before the old 45s STALL_TIMEOUT would ever fire.
+                    #     A short-poll timeout here does NOT mean "give up" -
+                    #     cancelling process.stdout.read() is safe to retry -
+                    #     nothing already buffered by the OS/transport is
+                    #     lost, we just loop and check again. STALL_TIMEOUT
+                    #     is still enforced below by accumulating
+                    #     silence_started_at across iterations - it just no
+                    #     longer blocks the loop for its full duration in one
+                    #     shot, so filler can start long before it fires.
+                    #
+                    # Raced against dts_jump_event (instead of a plain
+                    # wait_for) so an absurd-DTS-jump line from stderr can
+                    # interrupt an in-progress read immediately, rather than
+                    # waiting for this read to time out or return a chunk.
+                    read_timeout = GAP_FILLER_THRESHOLD if got_first_byte else STARTUP_TIMEOUT
+                    read_task = asyncio.ensure_future(process.stdout.read(65536))
+                    event_task = asyncio.ensure_future(dts_jump_event.wait())
+                    done, pending = await asyncio.wait(
+                        {read_task, event_task},
+                        timeout=read_timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in pending:
+                        t.cancel()
+
+                    if event_task in done:
+                        logger.warning(
+                            f"[broker] Absurd DTS discontinuity on {url}: "
+                            f"{dts_jump_reason['text']}. Forcing respawn "
+                            f"(filler already covers the client-visible gap)."
                         )
-                    except asyncio.TimeoutError:
+                        dts_jump_triggered = True
+                        stalled = True
+                        break
+
+                    if read_task not in done:
+                        # Timed out without a chunk or a DTS-jump signal.
                         if not got_first_byte:
                             logger.warning(
                                 f"[broker] No initial data from FFmpeg within {STARTUP_TIMEOUT}s "
@@ -367,6 +471,8 @@ class ChannelBroker:
                             stalled = True
                             break
                         continue  # keep short-polling; do NOT respawn yet
+
+                    chunk = read_task.result()
                     if not chunk:
                         break
                     silence_started_at = None
@@ -401,7 +507,9 @@ class ChannelBroker:
                         pass
                 stderr_task.cancel()
 
-            if stalled:
+            if dts_jump_triggered:
+                logger.warning(f"[broker] Worker respawning for {url} (absurd DTS jump). Re-spawning...")
+            elif stalled:
                 logger.warning(f"[broker] Worker stalled (silent upstream) for {url}. Re-spawning...")
             else:
                 logger.warning(f"[broker] Upstream disconnected for {url}. Re-spawning...")
